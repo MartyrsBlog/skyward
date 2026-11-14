@@ -15,3 +15,9 @@ NOTES.md
 TODO.md
 *.draft.md
 notes/
+
+# Local images, unpacked firmware and the porting scripts stay out of the tree.
+stock/
+analysis/
+tools/
+*.img

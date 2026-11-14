@@ -683,6 +683,11 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
     if let Some(dir) = libraries {
         path.push(dir.to_string_lossy().into_owned());
     }
+    // What the supplicant says as it starts is kept beside the recovery's own
+    // log: one that ends at once otherwise leaves no word of why.
+    let folder = Path::new(skyward_sys::LOG).parent().unwrap_or(Path::new("/")).join("services");
+    let _ = fs::create_dir_all(&folder);
+    let said = fs::File::create(folder.join("wpa_supplicant.err"));
     let mut child = Process::new(&cfg.supplicant)
         .args(["-i", &cfg.interface, "-D", "nl80211", "-c"])
         .arg(&settings)
@@ -690,7 +695,10 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(match said {
+            Ok(file) => Stdio::from(file),
+            Err(_) => Stdio::null(),
+        })
         .spawn()
         .with_context(|| format!("start {}", cfg.supplicant))?;
     let until = Instant::now() + SOCKET_WAIT;

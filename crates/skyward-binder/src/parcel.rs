@@ -2,8 +2,19 @@ use anyhow::{bail, Context, Result};
 
 /// The mark libbinder writes into every call header. Both ends have to agree
 /// on it: it tells apart the copies of libbinder a phone carries, and the one
-/// the recovery's own programs are built from is the recovery copy.
-const HEADER: i32 = i32::from_be_bytes(*b"RECO");
+/// the recovery's own programs are built from is the recovery copy. A service
+/// directory started from the installed system is built from the other copy,
+/// and turns away a call that carries the recovery's mark.
+const RECOVERY_HEADER: i32 = i32::from_be_bytes(*b"RECO");
+const SYSTEM_HEADER: i32 = i32::from_be_bytes(*b"SYST");
+
+static HEADER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(RECOVERY_HEADER);
+
+/// Speak the dialect of the installed system's own libbinder, for a service
+/// directory run from its partitions rather than from the recovery's.
+pub fn speak_the_system_dialect() {
+    HEADER.store(SYSTEM_HEADER, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Strict mode gathers violations rather than acting on them; a caller with
 /// no policy of its own still sets that bit.
@@ -76,7 +87,7 @@ impl Parcel {
         let mut p = Parcel::default();
         p.i32(STRICT_MODE_PENALTY_GATHER);
         p.i32(UNSET_WORK_SOURCE);
-        p.i32(HEADER);
+        p.i32(HEADER.load(std::sync::atomic::Ordering::Relaxed));
         p.string(interface);
         p
     }

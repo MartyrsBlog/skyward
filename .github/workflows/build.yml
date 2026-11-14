@@ -101,7 +101,9 @@ jobs:
             test -f "devices/$DEVICE.toml"
             echo "devices=$(jq -nc --arg device "$DEVICE" '[$device]')" >> "$GITHUB_OUTPUT"
           else
-            echo "devices=$(basename -s .toml devices/*.toml | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+            # This fork carries one phone's port; every other device is built
+            # by the project it is forked from.
+            echo 'devices=["diting"]' >> "$GITHUB_OUTPUT"
           fi
 
   recovery:
@@ -147,9 +149,24 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ]; then version="$GITHUB_REF_NAME"; else version="${GITHUB_SHA::7}"; fi
           name="skyward-$version-$DEVICE-$STOCK"
           mkdir out
+          # A configuration that names the folder by the version the stock
+          # image is of gets the directories kept beside the sources: a HIDL
+          # service registers only with one of its own version.
+          sdk=$(tools/skyward-pack cat stock/recovery.img prop.default |
+            sed -n 's/^ro\.vendor\.build\.version\.sdk=//p' | head -1)
+          test -n "$sdk"
+          extra=()
+          if grep -q '{sdk}' "devices/$DEVICE.toml"; then
+            for lib in companion/a"$sdk"/lib/*.so; do
+              extra+=(--extra "$lib:skyward/hidl/a$sdk/lib/$(basename "$lib")")
+            done
+            for program in servicemanager hwservicemanager; do
+              extra+=(--extra "companion/a$sdk/$program:skyward/hidl/a$sdk/$program:0755")
+            done
+          fi
           tools/skyward-pack recovery --stock stock/recovery.img --binary tools/skyward --system-init tools/system-init \
             --config "devices/$DEVICE.toml" --font resources/fonts/MiSansVF.ttf --mono resources/fonts/KirkMono-Regular.ttf \
-            --mono-license resources/fonts/KirkMono-OFL.txt --out "out/$name.img"
+            --mono-license resources/fonts/KirkMono-OFL.txt "${extra[@]}" --out "out/$name.img"
           echo "name=$name" >> "$GITHUB_OUTPUT"
       # The image is the whole partition, flashed as it is, and most of it
       # is the room the recovery leaves empty; it is handed out zipped.

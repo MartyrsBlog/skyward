@@ -220,3 +220,50 @@ jobs:
             zips+=("$zip#$model ($device)")
           done
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes "${zips[@]}" images/SHA256SUMS
+
+  # The project publishes on a version tag; this fork makes no version of its
+  # own, so a build is published by hand under the commit it was made from.
+  publish:
+    name: Publish the build
+    if: github.event_name == 'workflow_dispatch'
+    needs: [check, recovery]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: skyward-*
+          path: images
+          merge-multiple: true
+          skip-decompress: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          tag="diting-${SHA:0:7}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "the release for $tag is already there" >&2
+            exit 1
+          fi
+          (cd images && sha256sum -- *.zip > SHA256SUMS)
+          cat > notes.md <<'TEXT'
+          从这次提交构建，基底是官方 `OS3.0.2.0.VLFCNXM` 全量包里的 recovery 分区。镜像里带了 vendor 同代
+          （Android 12 / SDK 31）的两个服务目录与依赖库，位于 `/skyward/hidl/a31/`。
+
+          刷入当前槽，另一个槽留着原来的 recovery 兜底：
+
+          ```
+          fastboot flash recovery_a <解压出来的 .img>
+          fastboot reboot recovery
+          ```
+
+          刷 recovery 不动 `boot`，KernelSU 不受影响。要回滚，把原来的 recovery 刷回去即可。
+          TEXT
+          gh release create "$tag" images/*.zip images/SHA256SUMS \
+            --target "$SHA" \
+            --title "Skyward for diting (${SHA:0:7})" \
+            --notes-file notes.md

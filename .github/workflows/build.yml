@@ -263,7 +263,10 @@ jobs:
 
           刷 recovery 不动 `boot`，KernelSU 不受影响。要回滚，把原来的 recovery 刷回去即可。
           TEXT
+          # A build by hand is a pre-release: it carries no version, and the
+          # recovery asks for the newest release proper when it looks for one.
           gh release create "$tag" images/*.zip images/SHA256SUMS \
             --target "$SHA" \
+            --prerelease \
             --title "Skyward for diting (${SHA:0:7})" \
             --notes-file notes.md

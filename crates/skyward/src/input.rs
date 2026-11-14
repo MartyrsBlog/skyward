@@ -244,8 +244,13 @@ impl Inputs {
                 self.wakeful.add(dev.as_raw_fd())?;
                 self.panel = Some(Panel::new(path, dev)?);
                 for w in &self.touch_writes {
-                    fs::write(&w.path, &w.value).with_context(|| format!("write {} to {}", w.value, w.path))?;
-                    skyward_sys::kmsg(&format!("wrote {} to {} for the touchscreen", w.value, w.path))?;
+                    // A build that keeps no such file, or keeps it somewhere
+                    // else, still has a panel to drive: what the phone does
+                    // not hold is left unwritten, not left unreadable.
+                    match fs::write(&w.path, &w.value) {
+                        Ok(()) => skyward_sys::kmsg(&format!("wrote {} to {} for the touchscreen", w.value, w.path))?,
+                        Err(e) => skyward_sys::kmsg(&format!("{} was not written for the touchscreen: {e}", w.path))?,
+                    }
                 }
             } else if keys {
                 set_nonblocking(dev.as_raw_fd()).context("make buttons non-blocking")?;

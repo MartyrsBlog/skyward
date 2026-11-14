@@ -176,6 +176,17 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
     let mut closed = Vec::new();
     let mut owner = Note::default();
     for user in open_users(service)? {
+        // A phone that never gave this user a screen lock need not keep a
+        // credential for them at all, and this one kept none: their own
+        // files are under a key the hardware holds, as the files readable
+        // before anyone signs in are.
+        if !has_credential(user) {
+            let note = open_user_files(service, user, None, None)?;
+            if user == OWNER {
+                owner = note;
+            }
+            continue;
+        }
         let protector = protector(user)?;
         match protector.lock {
             None => {
@@ -370,6 +381,29 @@ fn blobs(user: u32) -> PathBuf {
     Path::new(PROTECTORS).join(user.to_string()).join(BLOBS)
 }
 
+/// Whether the phone keeps any credential state for `user` at all: one
+/// blob for each way some part of the phone was given to reach their
+/// secret. Android writes one as it makes the user, so a phone that has
+/// none was never given a screen lock on that user at all.
+fn has_credential(user: u32) -> bool {
+    std::fs::read_dir(blobs(user)).is_ok_and(|entries| entries.flatten().any(|entry| entry.path().extension().is_some_and(|e| e == "spblob")))
+}
+
+/// Open `user`'s own files where the phone keeps no credential state for
+/// them: their key is the one the hardware holds, as the key of the files
+/// readable before anyone signs in is. Nothing the user knows is needed.
+fn open_files_under_hardware_key(service: &KeyMint, user: u32) -> Result<Note> {
+    let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read {FILE_MODE}"))?;
+    let wrapped = crate::fscrypt::hardware_wrapped(mode.trim());
+    let dir = Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current");
+    let raw = hardware_key(service, &dir, wrapped)?;
+    crate::fscrypt::add_key(Path::new(MOUNT), &raw, wrapped)?;
+    if user == OWNER {
+        show_owner_storage()?;
+    }
+    Ok(Note::default())
+}
+
 /// Where a phone keeps the credential it made up itself for a user whose
 /// screen lock is the owner's. The file holds a nonce and then the
 /// credential, encrypted under a key the owner's own secret guards.
@@ -430,6 +464,9 @@ const TAG_BYTES: usize = 16;
 /// owner's own secret gave. The owner's files open, their shared storage
 /// shows at /sdcard.
 fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owner: Option<&Token>) -> Result<Note> {
+    if !has_credential(user) {
+        return open_files_under_hardware_key(service, user);
+    }
     let protector = protector(user)?;
     let stretched = match &protector.lock {
         Some(lock) => {

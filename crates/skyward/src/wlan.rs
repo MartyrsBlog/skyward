@@ -621,6 +621,15 @@ impl Station {
 }
 
 /// Load the driver where its interface is not there yet, and bring the
+/// interface up, ahead of the switch: the chip's own coming up takes the
+/// better part of ten seconds, and a recovery may as well spend that while
+/// its user is still reading the screen. What this costs is the chip's
+/// power; what failing costs is the wait, not the WLAN.
+pub fn prewarm(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
+    bring_up(cfg, modules)
+}
+
+/// Load the driver where its interface is not there yet, and bring the
 /// interface up.
 fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
     let net = Path::new("/sys/class/net").join(&cfg.interface);
@@ -683,6 +692,11 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
     if let Some(dir) = libraries {
         path.push(dir.to_string_lossy().into_owned());
     }
+    // What the supplicant says as it starts is kept beside the recovery's own
+    // log: one that ends at once otherwise leaves no word of why.
+    let folder = Path::new(skyward_sys::LOG).parent().unwrap_or(Path::new("/")).join("services");
+    let _ = fs::create_dir_all(&folder);
+    let said = fs::File::create(folder.join("wpa_supplicant.err"));
     let mut child = Process::new(&cfg.supplicant)
         .args(["-i", &cfg.interface, "-D", "nl80211", "-c"])
         .arg(&settings)
@@ -690,7 +704,10 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(match said {
+            Ok(file) => Stdio::from(file),
+            Err(_) => Stdio::null(),
+        })
         .spawn()
         .with_context(|| format!("start {}", cfg.supplicant))?;
     let until = Instant::now() + SOCKET_WAIT;

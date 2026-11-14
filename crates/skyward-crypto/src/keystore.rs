@@ -25,6 +25,10 @@ const FN_KEY_BLOB: &str = "keymaster_key_blob";
 const FN_SECDISCARDABLE: &str = "secdiscardable";
 const FN_STRETCHING: &str = "stretching";
 
+/// What Android writes in the stretching file of a key it did not stretch.
+/// A build old enough to keep no such file at all stretched none either.
+const NO_STRETCHING: &str = "nopassword";
+
 /// SHA-512 of `data` behind a fixed prefix.
 pub fn hash_with_prefix(prefix: &[u8], data: &[u8]) -> Vec<u8> {
     let mut padded = prefix.to_vec();
@@ -69,8 +73,14 @@ impl StoredKey {
         if version.trim() != VERSION {
             bail!("{} is written in layout {}, Skyward reads layout {VERSION}", dir.display(), version.trim());
         }
-        if dir.join(FN_STRETCHING).exists() {
-            bail!("{} was written by an Android too old for Skyward to read", dir.display());
+        if let Ok(algorithm) = fs::read_to_string(dir.join(FN_STRETCHING)) {
+            // A key the phone stretched is stretched with an algorithm of
+            // its own, which this does not carry: only the word Android
+            // writes for a key it left as it was is read on.
+            let algorithm = algorithm.trim();
+            if algorithm != NO_STRETCHING {
+                bail!("{} is stretched with {algorithm}, which Skyward does not read", dir.display());
+            }
         }
         let secdiscardable_hash = match dir.join(FN_SECDISCARDABLE).exists() {
             true => hash_with_prefix(SECDISCARDABLE_PREFIX, &read(FN_SECDISCARDABLE)?),
@@ -221,13 +231,19 @@ mod tests {
         assert!(s.unwrap(Unwrap::<NoService>::Secret(b"s")).is_err());
     }
 
+    /// A key the phone stretched is stretched with an algorithm of its own,
+    /// which this does not carry. The word Android writes for a key it left
+    /// as it was is read on: a phone whose data was never given a password
+    /// keeps its metadata key that way.
     #[test]
-    fn a_directory_in_an_older_layout_is_refused() {
-        let dir = tempdir("older-layout");
+    fn a_stretched_key_is_refused_and_an_unstretched_one_is_read() {
+        let dir = tempdir("stretching");
         fs::write(dir.join(FN_VERSION), "1").unwrap();
         fs::write(dir.join(FN_ENCRYPTED_KEY), [0u8; 64]).unwrap();
         fs::write(dir.join(FN_STRETCHING), "scrypt 15 8 1").unwrap();
-        assert!(refusal(&dir).contains("too old"), "{}", refusal(&dir));
+        assert!(refusal(&dir).contains("scrypt 15 8 1"), "{}", refusal(&dir));
+        fs::write(dir.join(FN_STRETCHING), NO_STRETCHING).unwrap();
+        assert!(StoredKey::load(&dir).is_ok(), "{} was refused", dir.display());
         fs::remove_file(dir.join(FN_STRETCHING)).unwrap();
         fs::write(dir.join(FN_VERSION), "2").unwrap();
         assert!(refusal(&dir).contains("layout 2"), "{}", refusal(&dir));

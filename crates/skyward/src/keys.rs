@@ -102,7 +102,18 @@ pub fn serves_elements(steps: &[Step]) -> bool {
 pub fn start(steps: &[Step]) -> Result<()> {
     for step in steps {
         match step {
-            Step::Start(program) => crate::services::start(std::slice::from_ref(program.as_ref()), None)?,
+            Step::Start(program) => {
+                // A service directory is one role: the first to start holds
+                // it, and one that follows cannot take it and answers
+                // nothing, holding up every program after it. The recovery
+                // starts one before this, of the version the phone's own
+                // services were built against.
+                if is_directory(&program.service.path) && directory_is_running(&program.service.path) {
+                    skyward_sys::kmsg(&format!("{}: a service directory already runs, so this one is left out", program.service.path))?;
+                    continue;
+                }
+                crate::services::start(std::slice::from_ref(program.as_ref()), None)?;
+            }
             Step::ServeElements => {
                 let readers = skyward_omapi::start()?;
                 skyward_sys::kmsg(&format!("{} is served, with a reader for each of {} secure elements: {}", skyward_omapi::SERVICE, readers.len(), readers.join(", ")))?;
@@ -110,6 +121,24 @@ pub fn start(steps: &[Step]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether the program is a service directory, of which only one can run.
+fn is_directory(path: &str) -> bool {
+    let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    name == "servicemanager" || name == "hwservicemanager"
+}
+
+/// Whether a program of that name runs now, wherever it was started from.
+fn directory_is_running(path: &str) -> bool {
+    let Some(name) = std::path::Path::new(path).file_name().and_then(|n| n.to_str()) else { return false };
+    let Ok(entries) = std::fs::read_dir("/proc") else { return false };
+    entries.flatten().any(|entry| {
+        std::fs::read_link(entry.path().join("exe"))
+            .ok()
+            .and_then(|target| target.file_name().map(|n| n.to_owned()))
+            .is_some_and(|found| found == name)
+    })
 }
 
 /// What `steps` are, a line each, as the `keys` command prints them.

@@ -106,6 +106,12 @@ impl App {
                         .map(|h| (h.action, h.rect))
                 };
                 let action = hit.map(|h| h.0);
+                // A control that itself sits against the edge is pressed, not
+                // swiped from: the on-screen keyboard's leftmost key starts a
+                // few dp in, and a finger on it that drifts sideways was being
+                // turned into a swipe back and lost, which reads as a key that
+                // does not always answer.
+                let at_edge = at_edge.filter(|_| hit.is_none_or(|(_, r)| r.x > m.dp(4.0)));
                 // A row of the page darkens behind its words a moment after
                 // the finger lands on it, if the finger stays.
                 let row = hit

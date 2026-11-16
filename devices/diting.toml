@@ -29,7 +29,11 @@ sources = ["vendor", "vendor_boot", "vendor_dlkm"]
 # The binder driver comes first: on the kernels whose build keeps it out of
 # the kernel itself, nothing that registers a service opens a device that
 # is not there, and the phone's own recovery loads it for that reason.
-load = ["binder_gki", "goodix_core", "fts_touch_spi", "focaltech_fts", "qcom-hv-haptics"]
+# The Goodix driver is left to the service below, which puts the files it
+# reads through the firmware loader where the loader looks first: those
+# files are on the vendor partition, under a folder the phone's own table
+# mounts the modem image over.
+load = ["binder_gki", "fts_touch_spi", "focaltech_fts", "qcom-hv-haptics"]
 
 # What turns the controller's raw frames into touches is Xiaomi's touch
 # feature service, and a recovery runs none of it: the driver reports
@@ -49,26 +53,27 @@ partition = "modem"
 mounted = ["persist"]
 
 # The kernel loads goodix_core from the vendor_boot ramdisk before the
-# modem partition is mounted over /vendor/firmware, so the firmware file
-# the driver asks for is not there yet and it gives up. With the
-# partition mounted and unmounted again the file is where the driver
-# looks, and loading the driver a second time finds it. The WLAN reads
-# its firmware from /firmware/image, which unmounting does not take away.
-# A build that keeps the driver elsewhere, or has none, is left as it is:
-# unmounting its firmware folder would only take something away.
+# modem partition is mounted over /vendor/firmware, so the files the
+# driver asks for are not there yet and it gives up. They are on the
+# vendor partition, under the folder the modem image covers: the driver
+# is given them through the first folder the firmware loader looks in,
+# which the vendor image's own copy of them is not under.
+# The modem image is left as it is. It carries the WLAN's firmware, and
+# a driver that asks for a file it cannot find takes the phone down.
+# A build that carries the driver elsewhere, or has none, is left as it
+# is: nothing is put in the loader's folder for it.
 [[service]]
 path = "/vendor/bin/sh"
 args = ["-c", '''
-# The modem image is mounted over the folder the driver reads its firmware
-# from, and unmounting it is not enough: the phone's own init mounts that
-# image again. The vendor partition is mounted again beside it and its own
-# firmware folder laid over the image, which no one mounts over afterwards.
 slot=$(getprop ro.boot.slot_suffix)
-mkdir -p /mnt/skyward-vendor
+mkdir -p /mnt/skyward-vendor /etc/firmware
 if mount -o ro /dev/block/mapper/vendor$slot /mnt/skyward-vendor 2>/dev/null; then
-    if [ -d /mnt/skyward-vendor/firmware ]; then
-        mount --bind /mnt/skyward-vendor/firmware /vendor/firmware 2>/dev/null
-    fi
+    for name in goodix_cfg_group_l12.bin goodix_firmware_l12.bin goodix_cfg_group_l12_new.bin goodix_firmware_l12_new.bin; do
+        if [ -f "/mnt/skyward-vendor/firmware/$name" ]; then
+            cp "/mnt/skyward-vendor/firmware/$name" "/etc/firmware/$name"
+        fi
+    done
+    umount -l /mnt/skyward-vendor 2>/dev/null
 fi
 for module in /vendor/lib/modules/goodix_core.ko /vendor_dlkm/lib/modules/goodix_core.ko /lib/modules/goodix_core.ko; do
     if [ -f "$module" ]; then

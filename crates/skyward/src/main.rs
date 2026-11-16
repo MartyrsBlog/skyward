@@ -224,6 +224,13 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    // A recovery that stops drawing is a phone that answers nothing. What
+    // ended it is written where its log is read from, so that a screen that
+    // went black once can be told why without a serial console.
+    #[cfg(target_os = "android")]
+    std::panic::set_hook(Box::new(|said| {
+        let _ = skyward_sys::kmsg(&format!("the recovery stopped: {said}"));
+    }));
     // init starts the recovery service by path with no arguments.
     let started_as = std::env::args_os().next().unwrap_or_default();
     let name = Path::new(&started_as).file_name().unwrap_or_default();

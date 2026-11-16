@@ -21,9 +21,12 @@ diagonal = 6.67
 # dependencies, and the copy in the vendor folder is the one the system
 # loads, whose dependencies bring xiaomi_touch and msm_drm.
 sources = ["vendor", "vendor_boot", "vendor_dlkm"]
-# The touchscreen: Goodix GTX8 behind Xiaomi's touch layer. The phone
-# also carries FocalTech's driver, which binds no device here.
-load = ["goodix_core"]
+# The touchscreen: Goodix GTX8 behind Xiaomi's touch layer. The phone also
+# carries FocalTech's driver, which binds no device here. Both are named,
+# under the two names the driver has been given across the phone's builds,
+# because a build carries only the one its own panels were fitted with and
+# a name it does not carry is skipped rather than stopping the boot.
+load = ["goodix_core", "fts_touch_spi", "focaltech_fts", "qcom-hv-haptics"]
 
 # What turns the controller's raw frames into touches is Xiaomi's touch
 # feature service, and a recovery runs none of it: the driver reports
@@ -48,9 +51,21 @@ mounted = ["persist"]
 # partition mounted and unmounted again the file is where the driver
 # looks, and loading the driver a second time finds it. The WLAN reads
 # its firmware from /firmware/image, which unmounting does not take away.
+# A build that keeps the driver elsewhere, or has none, is left as it is:
+# unmounting its firmware folder would only take something away.
 [[service]]
 path = "/vendor/bin/sh"
-args = ["-c", "umount /vendor/firmware 2>/dev/null; rmmod goodix_core 2>/dev/null; insmod /vendor/lib/modules/goodix_core.ko 2>/dev/null; true"]
+args = ["-c", '''
+for module in /vendor/lib/modules/goodix_core.ko /vendor_dlkm/lib/modules/goodix_core.ko /lib/modules/goodix_core.ko; do
+    if [ -f "$module" ]; then
+        umount /vendor/firmware 2>/dev/null
+        rmmod goodix_core 2>/dev/null
+        insmod "$module"
+        break
+    fi
+done
+true
+''']
 oneshot = true
 user = "root"
 groups = ["root", "system"]

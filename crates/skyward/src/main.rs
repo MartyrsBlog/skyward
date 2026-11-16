@@ -611,6 +611,16 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     for (name, why) in missing {
         skyward_sys::kmsg(&format!("the phone carries no {name} to load: {why:#}"))?;
     }
+    // The nodes a driver makes belong to root until the phone's own rules
+    // are given to them, and the programs that use the keys run as users of
+    // their own: qseecom's is opened by the key service as system, and the
+    // driver leaves it to root. The rules are applied again now that the
+    // modules have made their nodes, the first pass having come too early
+    // for any of them.
+    match skyward_sys::ueventd::apply() {
+        Ok(nodes) => skyward_sys::kmsg(&format!("{nodes} device nodes given the owner their phone describes"))?,
+        Err(e) => skyward_sys::kmsg(&format!("the device nodes are not given the owners the phone describes: {e:#}"))?,
+    }
     // The binder driver's own filesystem holds the nodes the phone's own
     // programs open. A kernel that keeps the driver as a module has none of
     // them until something mounts it, and until then nothing that registers

@@ -71,7 +71,7 @@ const BINDER_NODES: [&str; 3] = ["binder", "vndbinder", "hwbinder"];
 /// Mount the driver's filesystem where it is not mounted yet, and put the
 /// nodes the phone's programs open at the names they ask for. Best effort:
 /// a kernel that has no driver leaves the recovery as it was.
-fn ensure_binder_nodes() {
+pub fn ensure_binder_nodes() {
     let dir = Path::new(BINDERFS);
     if !dir.exists() {
         if fs::create_dir_all(dir).is_err() {

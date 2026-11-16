@@ -611,6 +611,13 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     for (name, why) in missing {
         skyward_sys::kmsg(&format!("the phone carries no {name} to load: {why:#}"))?;
     }
+    // The binder driver's own filesystem holds the nodes the phone's own
+    // programs open. A kernel that keeps the driver as a module has none of
+    // them until something mounts it, and until then nothing that registers
+    // a service starts at all — nor does anything that reads the keys.
+    secure::ensure_binder_nodes();
+    let binder = if Path::new("/dev/binder").exists() { "ready" } else { "missing" };
+    skyward_sys::kmsg(&format!("the binder device is {binder} at /dev/binder"))?;
     if !cfg.owners.is_empty() {
         let handed = hand_over(&cfg.owners)?;
         skyward_sys::kmsg(&format!("{handed} of the phone's own files handed to the accounts its init gives them"))?;
@@ -650,8 +657,15 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     let mut told = registering.clone();
     told.extend(described.into_iter().filter(|name| !registering.contains(name)));
     if !told.is_empty() {
-        secure::publish_descriptions(&told)?;
-        skyward_sys::kmsg(&format!("the service directory is told of {} of the phone's own services", told.len()))?;
+        // A service directory that turns the telling down — a phone whose
+        // own system describes its services otherwise — leaves the phone's
+        // programs to start anyway: the ones this recovery starts for the
+        // touchscreen and the keys are not there to be told of, and neither
+        // is what decrypts the data partition.
+        match secure::publish_descriptions(&told) {
+            Ok(()) => skyward_sys::kmsg(&format!("the service directory is told of {} of the phone's own services", told.len()))?,
+            Err(e) => skyward_sys::kmsg(&format!("the service directory is not told of the phone's services: {e:#}"))?,
+        }
     }
     let libraries = secure::libraries()?;
     if let Some(dir) = &libraries {

@@ -628,6 +628,21 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     secure::ensure_binder_nodes();
     let binder = if Path::new("/dev/binder").exists() { "ready" } else { "missing" };
     skyward_sys::kmsg(&format!("the binder device is {binder} at /dev/binder"))?;
+    // Where the configuration asks for it, the WLAN's chip is brought up
+    // here, while the screen is still coming up: the chip's own start takes
+    // the better part of ten seconds, which its user would wait at the
+    // switch. On its own thread, so a chip that is slow to start holds up
+    // nothing but itself.
+    if let Some(wlan) = &cfg.wlan
+        && wlan.prewarm
+    {
+        let dirs = module_dirs(cfg)?;
+        let wlan = wlan.clone();
+        std::thread::spawn(move || match wlan::prewarm(&wlan, &dirs) {
+            Ok(()) => { let _ = skyward_sys::kmsg("the WLAN's chip is up ahead of its switch"); }
+            Err(e) => { let _ = skyward_sys::kmsg(&format!("the WLAN's chip is not up ahead of its switch: {e:#}")); }
+        });
+    }
     if !cfg.owners.is_empty() {
         let handed = hand_over(&cfg.owners)?;
         skyward_sys::kmsg(&format!("{handed} of the phone's own files handed to the accounts its init gives them"))?;

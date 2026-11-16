@@ -372,8 +372,11 @@ fn ready(s: &Service) -> Result<()> {
     };
     let until = Instant::now() + READY_TIMEOUT;
     loop {
+        // A property says a program is ready by being set at all, the
+        // phone's init counting a false one as unset: it sets some to
+        // false when the program starts again.
         if let Some(name) = &s.ready_property
-            && skyward_sys::prop(name).is_some_and(|v| !v.is_empty())
+            && skyward_sys::prop(name).is_some_and(|value| !value.is_empty() && value != "false" && value != "0")
         {
             return Ok(());
         }

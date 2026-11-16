@@ -164,6 +164,14 @@ const HARDWARE_DRIVER_NODE: &str = "/dev/binderfs/hwbinder";
 /// itself off when the running system does not describe it.
 const HARDWARE_DIRECTORY: &str = "android.hidl.manager@1.2::IServiceManager/default";
 
+/// The name the phone's init knows that directory's program by, which is
+/// also how the two directories are told apart here, and the property it
+/// sets once it takes registrations: on the phone init waits for it before
+/// it starts a service of that kind, which is turned away and ends where
+/// it comes first.
+const HARDWARE_DIRECTORY_PROGRAM: &str = "hwservicemanager";
+const HARDWARE_DIRECTORY_READY: &str = "hwservicemanager.ready";
+
 /// What says the directory is off. It is read by the services, and in a
 /// recovery there is nothing else to set it.
 const DIRECTORY_OFF: &str = "hwservicemanager.disabled";
@@ -241,6 +249,13 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     // description, and a run of it before this was written may have left
     // that behind.
     skyward_sys::set_prop(DIRECTORY_OFF, "false")?;
+    // What was described above is what a directory of the older kind
+    // starts on: it is started here, so that the phone's services of that
+    // kind find one waiting when they are started.
+    match start_directories() {
+        Ok(()) => skyward_sys::kmsg("the directories the phone's services register with are running")?,
+        Err(e) => skyward_sys::kmsg(&format!("the directory for the phone's hardware services is not up: {e:#}"))?,
+    }
     Ok(())
 }
 
@@ -326,8 +341,10 @@ fn directory_libraries() -> Result<String> {
 /// programs register with them, and without one nothing that uses the
 /// phone's keys can come up.
 fn start_directories() -> Result<()> {
-    for (_, programs) in directory_kinds() {
+    let mut hardware = false;
+    for (name, programs) in directory_kinds() {
         let Some(program) = programs.iter().find(|p| Path::new(p.as_str()).is_file()).cloned() else { continue };
+        hardware |= name == HARDWARE_DIRECTORY_PROGRAM;
         if crate::services::running(&program).is_some() {
             continue;
         }
@@ -335,6 +352,12 @@ fn start_directories() -> Result<()> {
         // The installed system's own directory is built from its own
         // libbinder, which marks calls differently from the recovery's.
         skyward_binder::parcel::speak_the_system_dialect();
+        if name == HARDWARE_DIRECTORY_PROGRAM {
+            // A run before this one, ended to start this one, leaves the
+            // property saying it was ready: the one about to start says so
+            // again once it takes registrations.
+            let _ = skyward_sys::set_prop(HARDWARE_DIRECTORY_READY, "false");
+        }
         match std::process::Command::new(&program)
             .env("LD_LIBRARY_PATH", &libs)
             .stdin(std::process::Stdio::null())
@@ -345,6 +368,9 @@ fn start_directories() -> Result<()> {
             Ok(_) => skyward_sys::kmsg(&format!("{program}: the service directory started"))?,
             Err(e) => skyward_sys::kmsg(&format!("{program}: the service directory did not start: {e}"))?,
         }
+    }
+    if hardware {
+        wait_for_hardware_directory();
     }
     let binder = skyward_binder::driver::Binder::open()?;
     let until = Instant::now() + Duration::from_secs(5);
@@ -357,6 +383,28 @@ fn start_directories() -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Wait until the directory for hardware services takes registrations, as
+/// the phone's init waits for it. A directory that never says so leaves
+/// the services of the older kind to end where they start, which the log
+/// then tells of rather than the boot being held up.
+fn wait_for_hardware_directory() {
+    let until = Instant::now() + Duration::from_secs(5);
+    let ready = loop {
+        if skyward_sys::prop(HARDWARE_DIRECTORY_READY).is_some_and(|value| value == "true") {
+            break true;
+        }
+        if Instant::now() >= until {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let said = match ready {
+        true => "the directory for the phone's hardware services takes registrations",
+        false => "the directory for the phone's hardware services does not say it takes registrations",
+    };
+    let _ = skyward_sys::kmsg(said);
 }
 
 /// Start the directory again after its descriptions changed: init runs no

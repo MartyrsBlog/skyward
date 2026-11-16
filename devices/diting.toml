@@ -26,7 +26,10 @@ sources = ["vendor", "vendor_boot", "vendor_dlkm"]
 # under the two names the driver has been given across the phone's builds,
 # because a build carries only the one its own panels were fitted with and
 # a name it does not carry is skipped rather than stopping the boot.
-load = ["goodix_core", "fts_touch_spi", "focaltech_fts", "qcom-hv-haptics"]
+# The binder driver comes first: on the kernels whose build keeps it out of
+# the kernel itself, nothing that registers a service opens a device that
+# is not there, and the phone's own recovery loads it for that reason.
+load = ["binder_gki", "goodix_core", "fts_touch_spi", "focaltech_fts", "qcom-hv-haptics"]
 
 # What turns the controller's raw frames into touches is Xiaomi's touch
 # feature service, and a recovery runs none of it: the driver reports
@@ -56,14 +59,25 @@ mounted = ["persist"]
 [[service]]
 path = "/vendor/bin/sh"
 args = ["-c", '''
+# The modem image is mounted over the folder the driver reads its firmware
+# from, and unmounting it is not enough: the phone's own init mounts that
+# image again. The vendor partition is mounted again beside it and its own
+# firmware folder laid over the image, which no one mounts over afterwards.
+slot=$(getprop ro.boot.slot_suffix)
+mkdir -p /mnt/skyward-vendor
+if mount -o ro /dev/block/mapper/vendor$slot /mnt/skyward-vendor 2>/dev/null; then
+    if [ -d /mnt/skyward-vendor/firmware ]; then
+        mount --bind /mnt/skyward-vendor/firmware /vendor/firmware 2>/dev/null
+    fi
+fi
 for module in /vendor/lib/modules/goodix_core.ko /vendor_dlkm/lib/modules/goodix_core.ko /lib/modules/goodix_core.ko; do
     if [ -f "$module" ]; then
-        umount /vendor/firmware 2>/dev/null
         rmmod goodix_core 2>/dev/null
         insmod "$module"
         break
     fi
 done
+umount -l /mnt/skyward-vendor 2>/dev/null
 true
 ''']
 oneshot = true

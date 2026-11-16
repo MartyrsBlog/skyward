@@ -1096,8 +1096,23 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
     // A uevent may be a charger or a computer attached or taken away: the
     // battery is read at once, and the phone stays awake until it is.
     let uevents = uevent::Listener::open()?;
+    let mut said = None::<String>;
     loop {
-        pages.turn(&sleeper, &uevents)?;
+        // A turn that ends badly — a panel that will not take a commit, a
+        // frame that does not come — is told of and the loop goes on. The
+        // phone's own screen is the only way it can be told anything, and a
+        // recovery that has stopped drawing answers nothing at all.
+        match pages.turn(&sleeper, &uevents) {
+            Ok(()) => said = None,
+            Err(e) => {
+                let why = format!("{e:#}");
+                if said.as_deref() != Some(why.as_str()) {
+                    skyward_sys::kmsg(&format!("a turn of the screen ended: {why}"))?;
+                    said = Some(why);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 }
 

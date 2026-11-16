@@ -781,9 +781,15 @@ pub mod kms {
             self.settle()?;
             let mut req = atomic::AtomicModeReq::new();
             req.add_property(self.conn, id, property::Value::UnsignedRange(rest));
-            self.card.atomic_commit(AtomicCommitFlags::empty(), req).context("rest the panel")?;
-            self.power = Power::Resting;
-            Ok(())
+            match self.card.atomic_commit(AtomicCommitFlags::empty(), req) {
+                Ok(()) => {
+                    self.power = Power::Resting;
+                    Ok(())
+                }
+                // A driver that will not rest the panel is asked to turn it
+                // off instead: resting only makes the way back on shorter.
+                Err(_) => self.turn_off(),
+            }
         }
 
         /// Turn the display off: the panel and the display processor feeding
@@ -909,7 +915,14 @@ pub mod kms {
 
         fn settle(&mut self) -> Result<()> {
             if self.flipping {
-                flipped(&self.card).context("flip")?;
+                // An event that does not come is not waited on for ever:
+                // some display drivers send none for a commit that leaves
+                // the display off, and the frames after it are still drawn
+                // and still reach the panel. Saying so and going on keeps
+                // the screen answering; stopping there leaves it black.
+                if let Err(e) = flipped(&self.card) {
+                    eprintln!("display: {e:#}");
+                }
                 self.flipping = false;
             }
             Ok(())

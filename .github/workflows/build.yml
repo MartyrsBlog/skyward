@@ -258,14 +258,14 @@ jobs:
           从这次提交构建，基底是官方 `OS3.0.2.0.VLFCNXM` 全量包里的 recovery 分区。镜像里带了 vendor 同代
           （Android 12 / SDK 31）的两个服务目录与依赖库，位于 `/skyward/hidl/a31/`。
 
-          刷入当前槽，另一个槽留着原来的 recovery 兜底：
+          刷入当前槽即可，另一个槽保持原样，要回去就把原来的 recovery 刷回去：
 
           ```
           fastboot flash recovery_a <解压出来的 .img>
           fastboot reboot recovery
           ```
 
-          刷 recovery 不动 `boot`，KernelSU 不受影响。要回滚，把原来的 recovery 刷回去即可。
+          刷 recovery 不动 `boot`，KernelSU 不受影响。
           TEXT
           # A build by hand is a pre-release: it carries no version, and the
           # recovery asks for the newest release proper when it looks for one.

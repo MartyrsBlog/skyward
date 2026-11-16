@@ -21,3 +21,6 @@ stock/
 analysis/
 tools/
 *.img
+
+# Build outputs.
+out/

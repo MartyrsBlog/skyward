@@ -1648,16 +1648,25 @@ impl<'a> Pages<'a> {
 
     /// One click of the motor, as strong as the settings say.
     fn click(&mut self) -> Result<()> {
-        if let Some(h) = &mut self.haptics {
-            h.click(self.app.state.vibration)?;
+        if let Some(h) = &mut self.haptics
+            && let Err(e) = h.click(self.app.state.vibration)
+        {
+            // A motor whose driver takes no effect of this phone's strength
+            // is left alone: a click that cannot be played is worth neither
+            // a turn of the screen nor a line in the log for every tap.
+            skyward_sys::kmsg(&format!("the motor is left alone: {e:#}"))?;
+            self.haptics = None;
         }
         Ok(())
     }
 
     /// The motor's ticks of the screen going off.
     fn ticks(&mut self) -> Result<()> {
-        if let Some(h) = &mut self.haptics {
-            h.ticks()?;
+        if let Some(h) = &mut self.haptics
+            && let Err(e) = h.ticks()
+        {
+            skyward_sys::kmsg(&format!("the motor is left alone: {e:#}"))?;
+            self.haptics = None;
         }
         Ok(())
     }

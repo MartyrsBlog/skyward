@@ -126,6 +126,10 @@ supplicant = "/vendor/bin/hw/wpa_supplicant"
 libraries = ["/skyward/hidl/a{sdk}/lib", "/vendor/lib64"]
 service = "android.hardware.wifi.supplicant.ISupplicant/default"
 probe = "http://connect.rom.miui.com/generate_204"
+# The chip's own coming up takes the better part of ten seconds once its
+# driver is in, which its user would wait at the switch: it is brought up
+# as the recovery starts instead.
+prewarm = true
 
 # The update server the stock updater of the Chinese system asks.
 [update]
@@ -143,10 +147,12 @@ recovery = "c4c720dd058a7526570bc956222577dd323409781a318a5021f99aec0a740fe8"
 # qcom-hv-haptics. The phone measures the motor as it boots, 169.8 Hz
 # here, and the driver plays samples at that frequency. The system's own
 # clicks feel as one at a quarter of this, and past three quarters the
-# motor rattles.
+# motor rattles. The driver takes no effect lighter than half its drive:
+# its converter does not run below that, and a lighter one is turned down
+# rather than played weakly, so this is where the slider's low end is.
 [haptics]
 resonance = "/sys/class/qcom-haptics/lra_frequency_hz"
-strength = { lightest = 0.25, strongest = 0.75 }
+strength = { lightest = 0.5, strongest = 1.0 }
 
 # The partitions a backup of the baseband and EFS takes: the baseband's
 # settings, with the IMEI, and the sensors' calibration. And what of the

@@ -1142,6 +1142,8 @@ struct Pages<'a> {
     /// adbd and fastbootd ask over it to go over to fastboot and back.
     control: Option<Control>,
     haptics: Option<Haptics>,
+    /// Said once a click the driver turned down, and no more.
+    motor_refused: bool,
     backlight: Backlight,
     keeper: Keeper,
     shown_clock: String,
@@ -1395,6 +1397,7 @@ impl<'a> Pages<'a> {
             touch_known: false,
             control,
             haptics,
+            motor_refused: false,
             backlight,
             keeper,
             shown_clock: String::new(),
@@ -1651,11 +1654,13 @@ impl<'a> Pages<'a> {
         if let Some(h) = &mut self.haptics
             && let Err(e) = h.click(self.app.state.vibration)
         {
-            // A motor whose driver takes no effect of this phone's strength
-            // is left alone: a click that cannot be played is worth neither
-            // a turn of the screen nor a line in the log for every tap.
-            skyward_sys::kmsg(&format!("the motor is left alone: {e:#}"))?;
-            self.haptics = None;
+            // A click the driver turns down costs its own tap, not the
+            // motor: the next may be one it takes. The first is said where
+            // its log is read from, and no more.
+            if !self.motor_refused {
+                skyward_sys::kmsg(&format!("the motor took no click, and is left trying: {e:#}"))?;
+                self.motor_refused = true;
+            }
         }
         Ok(())
     }
@@ -1664,9 +1669,10 @@ impl<'a> Pages<'a> {
     fn ticks(&mut self) -> Result<()> {
         if let Some(h) = &mut self.haptics
             && let Err(e) = h.ticks()
+            && !self.motor_refused
         {
-            skyward_sys::kmsg(&format!("the motor is left alone: {e:#}"))?;
-            self.haptics = None;
+            skyward_sys::kmsg(&format!("the motor took no ticks, and is left trying: {e:#}"))?;
+            self.motor_refused = true;
         }
         Ok(())
     }

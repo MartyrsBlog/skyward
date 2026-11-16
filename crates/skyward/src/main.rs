@@ -502,8 +502,12 @@ fn lp(super_dev: &Path, slot: Option<u32>) -> Result<()> {
 
 /// Load `names` from the module sources the configuration lists.
 fn load_modules(cfg: &DeviceConfig, names: &[String]) -> Result<Vec<PathBuf>> {
-    let dirs = cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect::<Result<Vec<_>>>()?;
-    skyward_modules::load(&dirs, names)
+    skyward_modules::load(&module_dirs(cfg)?, names)
+}
+
+/// The folders the configuration's module sources name.
+fn module_dirs(cfg: &DeviceConfig) -> Result<Vec<PathBuf>> {
+    cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect()
 }
 
 /// Start the recovery's own logd where it needs libraries of the installed
@@ -542,8 +546,15 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
         let at = skyward_block::fstab::mount(name)?;
         skyward_sys::kmsg(&format!("{name} is mounted on {}", at.display()))?;
     }
-    for path in load_modules(cfg, &cfg.modules.load)? {
+    let (loaded, missing) = skyward_modules::load_each(&module_dirs(cfg)?, &cfg.modules.load);
+    for path in loaded {
         skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
+    }
+    // A module the phone's own build does not carry costs its own device:
+    // the touchscreen without its driver, say. What reads the phone's keys
+    // must still start, so the rest of the boot goes on without it.
+    for (name, why) in missing {
+        skyward_sys::kmsg(&format!("the phone carries no {name} to load: {why:#}"))?;
     }
     if !cfg.owners.is_empty() {
         let handed = hand_over(&cfg.owners)?;

@@ -7,7 +7,7 @@
 use crate::encryption::{key_dir, target, Encryption};
 use crate::gatekeeper::Gatekeeper;
 use crate::keymint::KeyMint;
-use crate::keystore::{StoredKey, Unwrap};
+use crate::keystore::{held_by_secret, StoredKey, Unwrap};
 use crate::token::Token;
 use crate::user::Bound;
 use crate::weaver::Weaver;
@@ -84,25 +84,59 @@ fn open(service: &KeyMint) -> Result<Opened> {
     })();
     match mounted {
         Ok((checked, filesystem)) => Ok(Opened { mapped, filesystem, checked }),
-        Err(e) => match dm::remove(MAPPED) {
-            Ok(()) => Err(e),
-            Err(r) => Err(e.context(format!("removing {MAPPED} afterwards failed too: {r:#}"))),
-        },
+        Err(e) => {
+            // Where nothing was mapped, there is no device to take away.
+            if dm::status(MAPPED).ok().flatten().is_some() {
+                match dm::remove(MAPPED) {
+                    Ok(()) => Err(e),
+                    Err(r) => Err(e.context(format!("removing {MAPPED} afterwards failed too: {r:#}"))),
+                }
+            } else {
+                Err(e)
+            }
+        }
     }
 }
 
 /// Map the data partition decrypted, under the key the phone keeps for it,
 /// and give its table's entries, the first the one the key is found by,
-/// and the device the filesystem is read and written through.
+/// and the device the filesystem is read and written through. A partition
+/// the phone's system never gave the layer to read it through — its table
+/// naming none, or naming one it keeps no key for — is mapped as it
+/// stands, the way the phone's own system reads it.
 fn map(service: &KeyMint) -> Result<(Vec<Entry>, PathBuf)> {
     let entries = skyward_block::fstab::read(MOUNT)?;
     let entry = entries.first().with_context(|| format!("the phone's own table says nothing about {MOUNT}"))?;
-    let encryption = Encryption::of(entry)?;
     let device = skyward_block::fstab::device(entry)?;
-    let key = storage_key(service, entry, &encryption)?;
-    let sectors = skyward_block::size_bytes(&device)? / 512;
-    let mapped = dm::create(MAPPED, &[target(&device, sectors, &key, &encryption)], false)?;
-    Ok((entries, mapped))
+    let layer = match Encryption::of(entry) {
+        Err(why) => Err(why),
+        Ok(encryption) => storage_key(service, entry, &encryption).map(|key| (key, encryption)),
+    };
+    let layer = match layer {
+        Ok(layer) => Some(layer),
+        Err(why) => {
+            // The layer stands where the table names it, keyed as the table
+            // says, and the phone holds none of it here. What the partition
+            // itself holds tells the two cases apart: a filesystem of its
+            // own is the phone's system reading it without the layer, and
+            // this reads it the same way; nothing of its own is a partition
+            // that waits for the key, and the key's folder names that.
+            let holds = skyward_block::probe::filesystem(Path::new(&device))?;
+            if !holds.as_deref().is_some_and(|holds| entries.iter().any(|e| e.filesystem == holds)) {
+                return Err(why);
+            }
+            skyward_sys::kmsg("the data partition holds no metadata layer to read it through: it is mounted as it stands")?;
+            None
+        }
+    };
+    match layer {
+        Some((key, encryption)) => {
+            let sectors = skyward_block::size_bytes(&device)? / 512;
+            let mapped = dm::create(MAPPED, &[target(&device, sectors, &key, &encryption)], false)?;
+            Ok((entries, mapped))
+        }
+        None => Ok((entries, device.into())),
+    }
 }
 
 /// Map the data partition decrypted without mounting it, for its
@@ -172,6 +206,18 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
         true => None,
         false => Some(open(service)?),
     };
+    // A partition the phone's system never encrypted file by file holds no
+    // folder for the keys of such files. Nothing on it is closed, and its
+    // files read as they stand: a partition laid out by hand rather than
+    // by Android, which the system runs as it is. The owner's shared
+    // storage shows where the partition holds one.
+    if !Path::new(KEY_FOLDER).is_dir() {
+        skyward_sys::kmsg("the data partition holds no encrypted files: its files read as they stand")?;
+        if Path::new(SHARED_STORAGE).join(OWNER.to_string()).is_dir() {
+            show_owner_storage()?;
+        }
+        return Ok(Opening { mounted, closed: Vec::new() });
+    }
     open_shared(service)?;
     let mut closed = Vec::new();
     let mut owner = Note::default();
@@ -195,6 +241,24 @@ pub fn open_without_credential(service: &KeyMint) -> Result<Opening> {
                     owner = note;
                 }
             }
+            // A user whose own key the key service holds in hardware needs
+            // nothing they know, whatever the phone keeps about a
+            // credential: the state it keeps may be from a screen lock its
+            // owner has taken away, and asking for what it guarded would be
+            // asking for nothing.
+            Some(lock) if !held_by_secret(&ce_current(user)) => match open_user_files(service, user, None, None) {
+                Ok(note) => {
+                    if user == OWNER {
+                        owner = note;
+                    }
+                }
+                Err(e) => closed.push(Closed {
+                    user,
+                    lock: lock.kind,
+                    made_up: made_up(user, &protector.id),
+                    why: Some(format!("{e:#}")),
+                }),
+            },
             Some(lock) => closed.push(Closed { user, lock: lock.kind, made_up: made_up(user, &protector.id), why: None }),
         }
     }
@@ -250,6 +314,9 @@ fn made_up(user: u32, id: &str) -> bool {
 const SHARED_KEY: &str = "/data/unencrypted/key";
 const SHARED_NAME: &str = "/data/unencrypted/ref";
 const FILE_MODE: &str = "/data/unencrypted/mode";
+/// Where the phone's system keeps the keys of the files it encrypted one by
+/// one: a partition given no such folder was never encrypted that way.
+const KEY_FOLDER: &str = "/data/unencrypted";
 
 /// Where the phone keeps each user's own keys.
 const USER_KEYS: &str = "/data/misc/vold/user_keys";
@@ -389,14 +456,18 @@ fn has_credential(user: u32) -> bool {
     std::fs::read_dir(blobs(user)).is_ok_and(|entries| entries.flatten().any(|entry| entry.path().extension().is_some_and(|e| e == "spblob")))
 }
 
+/// Where a user's own key is kept.
+fn ce_current(user: u32) -> PathBuf {
+    Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current")
+}
+
 /// Open `user`'s own files where the phone keeps no credential state for
 /// them: their key is the one the hardware holds, as the key of the files
 /// readable before anyone signs in is. Nothing the user knows is needed.
 fn open_files_under_hardware_key(service: &KeyMint, user: u32) -> Result<Note> {
     let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read {FILE_MODE}"))?;
     let wrapped = crate::fscrypt::hardware_wrapped(mode.trim());
-    let dir = Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current");
-    let raw = hardware_key(service, &dir, wrapped)?;
+    let raw = hardware_key(service, &ce_current(user), wrapped)?;
     crate::fscrypt::add_key(Path::new(MOUNT), &raw, wrapped)?;
     if user == OWNER {
         show_owner_storage()?;
@@ -464,7 +535,12 @@ const TAG_BYTES: usize = 16;
 /// owner's own secret gave. The owner's files open, their shared storage
 /// shows at /sdcard.
 fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owner: Option<&Token>) -> Result<Note> {
-    if !has_credential(user) {
+    // A user's own key is opened the way it was wrapped. One the key
+    // service holds in hardware is behind nothing the user knows, whatever
+    // the phone keeps about a credential: the state it keeps may be from a
+    // screen lock its owner has taken away, while the key stayed wrapped
+    // as it was.
+    if !held_by_secret(&ce_current(user)) || !has_credential(user) {
         return open_files_under_hardware_key(service, user);
     }
     let protector = protector(user)?;
@@ -519,7 +595,7 @@ fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owne
 
     let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read {FILE_MODE}"))?;
     let wrapped = crate::fscrypt::hardware_wrapped(mode.trim());
-    let dir = Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current");
+    let dir = ce_current(user);
     let stored = StoredKey::load(&dir).with_context(|| format!("read the key in {}", dir.display()))?;
     let raw = stored.unwrap(Unwrap::<KeyMint>::Secret(&file_secret)).with_context(|| format!("unwrap the key in {}", dir.display()))?;
     let raw = match wrapped {

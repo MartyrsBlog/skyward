@@ -162,6 +162,9 @@ pub struct State {
     pub joining: Option<Network>,
     /// The network the details page is of, as it was found.
     pub details: Option<Network>,
+    /// The networks the phone holds, as the store last said, for the WLAN
+    /// page's section of them.
+    pub saved: Vec<Saved>,
     /// The network the page that adds one is adding.
     pub adding: Option<Adding>,
     /// The password typed on the password page or the page that adds a
@@ -256,6 +259,7 @@ impl Default for State {
             wlan: None,
             joining: None,
             details: None,
+            saved: Vec::new(),
             adding: None,
             password: String::new(),
             show_password: false,

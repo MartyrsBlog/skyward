@@ -56,7 +56,17 @@ impl App {
         if self.state.wlan.as_ref() == Some(&w) {
             return;
         }
+        // What the runtime keeps is written on the phone as a network
+        // comes to hold keys with it: what the phone holds is read again
+        // where the one joined has come that far, or is another one.
+        let was = self.state.wlan.as_ref().and_then(|w| {
+            w.joined.as_ref().map(|j| (j.ssid.clone(), matches!(j.stage, Joining::Connected(_))))
+        });
+        let come = w.joined.as_ref().map(|j| (j.ssid.clone(), matches!(j.stage, Joining::Connected(_))));
         self.state.wlan = Some(w);
+        if come.is_some_and(|(ssid, on)| on && was.is_none_or(|(old, done)| !done || old != ssid)) {
+            self.refresh_saved();
+        }
         if matches!(self.screen(), Screen::Home | Screen::Wlan | Screen::WlanNetwork | Screen::Update | Screen::SkywardUpdate) {
             self.refresh();
         }
@@ -89,6 +99,21 @@ impl App {
         self.state.show_password = false;
         self.state.layer = Layer::Letters;
         self.open(Screen::WlanPassword);
+    }
+
+    /// The network the phone holds for `ssid`, where it holds one: a
+    /// network joined before, read from where it is kept.
+    pub(super) fn held(&self, ssid: &[u8]) -> Option<skyward_net::saved::Saved> {
+        skyward_net::saved::load(&skyward_net::saved::folder())
+            .ok()?
+            .into_iter()
+            .find(|held| held.ssid == ssid)
+    }
+
+    /// What the phone holds, as the store last said, for the WLAN page's
+    /// section of them.
+    pub(super) fn refresh_saved(&mut self) {
+        self.state.saved = skyward_net::saved::load(&skyward_net::saved::folder()).unwrap_or_default();
     }
 }
 
@@ -138,7 +163,9 @@ mod tests {
         assert_eq!(fmt::wlan_value(Lang::Hans, app.state.wlan.as_ref().unwrap()), "Skyward");
         tap(&mut app, &f, &i, Action::OpenJoined);
         assert_eq!(app.screen(), Screen::WlanNetwork);
-        assert_eq!(tap(&mut app, &f, &i, Action::LeaveNetwork), vec![Effect::LeaveWlan]);
+        let forgotten = Effect::ForgetWlan { ssid: b"Skyward".to_vec() };
+        assert_eq!(format!("{forgotten:?}"), r#"ForgetWlan { ssid: [83, 107, 121, 119, 97, 114, 100] }"#);
+        assert_eq!(tap(&mut app, &f, &i, Action::LeaveNetwork), vec![forgotten]);
         assert_eq!(app.screen(), Screen::Wlan);
         assert_eq!(tap(&mut app, &f, &i, Action::Toggle(Switch::Wlan)), vec![Effect::Wlan(false)]);
         assert_eq!(app.state.wlan, Some(Wlan::default()));
@@ -310,6 +337,52 @@ mod tests {
         app.touch(Touch::Up, &f, 0);
         assert_eq!(app.state.held, None);
         assert_eq!(app.state.adding.as_ref().unwrap().security, Security::Sae);
+    }
+
+    #[test]
+    fn the_networks_the_phone_holds_join_from_their_section_and_show_their_details() {
+        let (f, i) = (fonts(), info());
+        let mut app = App::new(Screen::Home, W, H, PPD);
+        let nearby = vec![network("Skyward", -34, Security::Psk), network("Far", -80, Security::Open)];
+        app.state.wlan = Some(Wlan { power: Power::On, networks: nearby, joined: None });
+        app.act(Action::Open(Screen::Wlan), 0);
+        // Opening the page reads what the store keeps; the store stands
+        // where no test has written it, so the section is filled by hand.
+        app.state.saved = vec![
+            skyward_net::saved::Saved { ssid: b"Skyward".to_vec(), security: Security::Psk, password: "secret12".into() },
+            skyward_net::saved::Saved { ssid: b"Away".to_vec(), security: Security::Psk, password: "away-pass".into() },
+        ];
+        app.refresh();
+        let fr = app.frame(&f, &i);
+        assert!(fr.hits.iter().any(|h| h.action == Action::JoinSaved(0)), "the section shows what the phone holds");
+        assert!(fr.hits.iter().any(|h| h.action == Action::SavedDetails(1)), "each row opens the details of its own");
+        // One that still answers a scan is joined with what is held, the
+        // way a nearby one is.
+        let join = Effect::JoinWlan { ssid: b"Skyward".to_vec(), name: "Skyward".into(), security: Security::Psk, password: Secret("secret12".into()) };
+        assert_eq!(tap(&mut app, &f, &i, Action::JoinSaved(0)), vec![join]);
+        // One that does not is told of by its details, which take it away.
+        assert!(tap(&mut app, &f, &i, Action::JoinSaved(1)).is_empty());
+        assert_eq!(app.screen(), Screen::WlanNetwork);
+        assert_eq!(app.state.details.as_ref().map(|n| n.name.as_str()), Some("Away"));
+        assert!(app.frame(&f, &i).hits.iter().any(|h| h.action == Action::LeaveNetwork), "what the phone holds can be taken from there");
+        let forgotten = Effect::ForgetWlan { ssid: b"Away".to_vec() };
+        assert_eq!(tap(&mut app, &f, &i, Action::LeaveNetwork), vec![forgotten]);
+        assert_eq!(app.state.saved.len(), 1, "what is deleted is no longer held");
+        assert_eq!(app.screen(), Screen::Wlan);
+        // The details of one in range are the ones of the scan.
+        tap(&mut app, &f, &i, Action::SavedDetails(0));
+        assert_eq!(app.state.details.as_ref().map(|n| n.name.as_str()), Some("Skyward"));
+        app.key(Key::Back, 0);
+        // Nothing is shown of the one joined in the section of them: it
+        // stands in the card of its own.
+        app.set_wlan(connected("Skyward"));
+        app.state.saved =
+            vec![skyward_net::saved::Saved { ssid: b"Skyward".to_vec(), security: Security::Psk, password: "secret12".into() }];
+        app.refresh();
+        assert!(
+            !app.frame(&f, &i).hits.iter().any(|h| matches!(h.action, Action::JoinSaved(_) | Action::SavedDetails(_))),
+            "the one joined stands in the card of its own"
+        );
     }
 
     #[test]

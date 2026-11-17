@@ -2638,6 +2638,7 @@ impl Pages<'_> {
                 wlan_worker(&self.wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0 })
             }
             Effect::LeaveWlan => wlan_worker(&self.wlan)?.send(wlan::Command::Leave),
+            Effect::ForgetWlan { ssid } => wlan_worker(&self.wlan)?.send(wlan::Command::Forget { ssid }),
             Effect::CheckUpdate => self.check_update()?,
             Effect::Download(release) => self.download(release, now)?,
             Effect::StopDownload => self.downloader.as_ref().context("there is no download to stop")?.stop(),

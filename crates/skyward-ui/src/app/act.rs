@@ -8,6 +8,11 @@ impl App {
         let l = self.state.lang;
         match action {
             Action::Open(s) => {
+                // The section of the networks the phone holds reads what
+                // the store keeps as the page comes up.
+                if s == Screen::Wlan {
+                    self.refresh_saved();
+                }
                 if s == Screen::Search && self.screen() == Screen::Home {
                     // The bar moves up from where it stands unfolded: a
                     // page easing there for the keys gets there at once.
@@ -400,7 +405,15 @@ impl App {
                     Security::Enterprise => {
                         self.say(l.pick(["暂不支持需要账号登录的网络", "尚不支援需要帳號登入的網路", "Networks that need an account sign-in aren't supported"]), now)
                     }
-                    s if s.password() => self.ask_password(network),
+                    // A network the phone holds is joined with what it
+                    // holds for it, without asking again for what is
+                    // already known.
+                    s if s.password() => match self.held(&network.ssid) {
+                        Some(held) => {
+                            return vec![Effect::JoinWlan { ssid: network.ssid, name: network.name, security: held.security, password: Secret(held.password) }];
+                        }
+                        None => self.ask_password(network),
+                    },
                     _ => {
                         return vec![Effect::JoinWlan {
                             ssid: network.ssid,
@@ -414,6 +427,48 @@ impl App {
             Action::NetworkDetails(i) => {
                 let w = self.state.wlan.as_ref().expect("networks show on a phone whose WLAN is brought up");
                 let Some(network) = w.networks.get(i).cloned() else { return Vec::new() };
+                self.state.details = Some(network);
+                self.open(Screen::WlanNetwork);
+            }
+            Action::JoinSaved(i) => {
+                let Some(held) = self.state.saved.get(i).cloned() else { return Vec::new() };
+                let w = self.state.wlan.as_ref().expect("saved networks show on a phone whose WLAN is brought up");
+                if w.joined.as_ref().is_some_and(|j| j.ssid == held.ssid) {
+                    return self.act(Action::OpenJoined, now);
+                }
+                let Some(found) = w.networks.iter().find(|n| n.ssid == held.ssid) else {
+                    // Where the scan no longer answers it, its details are
+                    // what is shown.
+                    let name = String::from_utf8_lossy(&held.ssid).into_owned();
+                    self.state.details = Some(Network {
+                        ssid: held.ssid,
+                        name,
+                        signal: 0,
+                        frequency: 0,
+                        bands: Default::default(),
+                        security: held.security,
+                    });
+                    self.open(Screen::WlanNetwork);
+                    return Vec::new();
+                };
+                // In range, it is joined with what the phone holds, the way
+                // a nearby row the phone holds is joined; what is held says
+                // how it was joined before.
+                let password = if held.security.password() { held.password } else { String::new() };
+                return vec![Effect::JoinWlan { ssid: found.ssid.clone(), name: found.name.clone(), security: held.security, password: Secret(password) }];
+            }
+            Action::SavedDetails(i) => {
+                let Some(held) = self.state.saved.get(i).cloned() else { return Vec::new() };
+                let w = self.state.wlan.as_ref().expect("saved networks show on a phone whose WLAN is brought up");
+                let name = String::from_utf8_lossy(&held.ssid).into_owned();
+                let network = w.networks.iter().find(|n| n.ssid == held.ssid).cloned().unwrap_or(Network {
+                    ssid: held.ssid,
+                    name,
+                    signal: 0,
+                    frequency: 0,
+                    bands: Default::default(),
+                    security: held.security,
+                });
                 self.state.details = Some(network);
                 self.open(Screen::WlanNetwork);
             }
@@ -438,8 +493,12 @@ impl App {
                 }
             }
             Action::LeaveNetwork => {
+                // Deleting takes the network from the ones the phone
+                // holds, so that it is not joined again on its own.
+                let Some(network) = self.state.details.clone() else { return Vec::new() };
+                self.state.saved.retain(|held| held.ssid != network.ssid);
                 let mut fx = self.back(now);
-                fx.push(Effect::LeaveWlan);
+                fx.push(Effect::ForgetWlan { ssid: network.ssid });
                 return fx;
             }
             Action::Rescan => return vec![Effect::ScanWlan],

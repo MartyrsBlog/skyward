@@ -28,6 +28,7 @@ use skyward_install::{Event, ImageKind, Outcome, Reflash, Refusal, Stage};
 use skyward_net::download::{Failure, Progress};
 use skyward_net::github::{Build, Newest};
 use skyward_net::release::{Release, Unanswered};
+use skyward_net::saved::Saved;
 use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Joined, Network, Power, Stage as Joining, Traffic, Wlan};
 use skyward_systems::{Overview, Who};
@@ -347,9 +348,15 @@ pub enum Action {
     /// Join the network at this place in the list of those in range, or
     /// open the page of the one joined.
     JoinNetwork(usize),
+    /// Join the network the phone holds at this place in the section of
+    /// them, where it still answers a scan; its details otherwise.
+    JoinSaved(usize),
     /// Open the details of the network at this place in the list of those
     /// in range.
     NetworkDetails(usize),
+    /// Open the details of the network the phone holds at this place in
+    /// the section of them.
+    SavedDetails(usize),
     /// The network chosen: its password again once refused, its details
     /// otherwise.
     OpenJoined,
@@ -571,6 +578,9 @@ pub enum Effect {
     ScanWlan,
     JoinWlan { ssid: Vec<u8>, name: String, security: Security, password: Secret },
     LeaveWlan,
+    /// Take a network from the ones the phone holds, so that it is not
+    /// joined again on its own.
+    ForgetWlan { ssid: Vec<u8> },
     /// Ask the update server for the newest system, telling what it
     /// answered with [`App::update_checked`].
     CheckUpdate,

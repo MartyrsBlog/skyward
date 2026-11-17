@@ -134,6 +134,11 @@ pub struct Wlan {
     /// of ten seconds, which the user would wait at the switch.
     #[serde(default)]
     pub prewarm: bool,
+    /// The regulatory domain the chip is told as the supplicant starts.
+    /// Where none is told, its firmware keeps the world-safe table, which
+    /// holds none of the higher 5 GHz channels a router here sits on.
+    #[serde(default)]
+    pub country: Option<String>,
 }
 
 /// A value written to a file, such as a switch in sysfs.

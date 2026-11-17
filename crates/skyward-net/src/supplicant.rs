@@ -142,6 +142,33 @@ pub fn unescape(text: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// The settings a network of this protection takes, as the pairs the
+/// supplicant reads the same way over the control interface and in its
+/// settings file.
+fn network_values(security: Security, password: &str) -> Result<Vec<(&'static str, String)>> {
+    let psk = || -> Result<String> {
+        ensure!((8..=63).contains(&password.len()), "a WPA2 password is 8 to 63 characters long");
+        ensure!(password.bytes().all(|b| (32..=126).contains(&b)), "a WPA2 password is printable ASCII");
+        Ok(format!("\"{password}\""))
+    };
+    Ok(match security {
+        Security::Open => vec![("key_mgmt", "NONE".into())],
+        Security::Owe => vec![("key_mgmt", "OWE".into()), ("ieee80211w", "2".into())],
+        Security::Psk => vec![("key_mgmt", "WPA-PSK WPA-PSK-SHA256".into()), ("psk", psk()?)],
+        Security::Sae => {
+            ensure!(!password.is_empty(), "a WPA3 password is not empty");
+            vec![("key_mgmt", "SAE".into()), ("sae_password", hex::encode(password)), ("ieee80211w", "2".into())]
+        }
+        Security::PskSae => vec![
+            ("key_mgmt", "WPA-PSK WPA-PSK-SHA256 SAE".into()),
+            ("psk", psk()?),
+            ("sae_password", hex::encode(password)),
+            ("ieee80211w", "1".into()),
+        ],
+        Security::Wep | Security::Enterprise => bail!("the recovery does not join a network protected so"),
+    })
+}
+
 /// What sets up a network with id `id` to join it: its name, how it is
 /// protected and its password. The name and a WPA3 password go as hex,
 /// which takes any byte; a WPA2 password goes in quotes, which the
@@ -149,41 +176,26 @@ pub fn unescape(text: &str) -> Result<Vec<u8>> {
 /// network `hidden`, which answers only a scan that names it, is scanned
 /// for by name.
 pub fn network_commands(id: u32, ssid: &[u8], security: Security, password: &str, hidden: bool) -> Result<Vec<String>> {
-    let set = |name: &str, value: String| format!("SET_NETWORK {id} {name} {value}");
-    let mut commands = vec![set("ssid", hex::encode(ssid))];
+    let mut commands = vec![format!("SET_NETWORK {id} ssid {}", hex::encode(ssid))];
     if hidden {
-        commands.push(set("scan_ssid", "1".into()));
+        commands.push(format!("SET_NETWORK {id} scan_ssid 1"));
     }
-    let psk = || -> Result<String> {
-        ensure!((8..=63).contains(&password.len()), "a WPA2 password is 8 to 63 characters long");
-        ensure!(password.bytes().all(|b| (32..=126).contains(&b)), "a WPA2 password is printable ASCII");
-        Ok(format!("\"{password}\""))
-    };
-    match security {
-        Security::Open => commands.push(set("key_mgmt", "NONE".into())),
-        Security::Owe => {
-            commands.push(set("key_mgmt", "OWE".into()));
-            commands.push(set("ieee80211w", "2".into()));
-        }
-        Security::Psk => {
-            commands.push(set("key_mgmt", "WPA-PSK WPA-PSK-SHA256".into()));
-            commands.push(set("psk", psk()?));
-        }
-        Security::Sae => {
-            ensure!(!password.is_empty(), "a WPA3 password is not empty");
-            commands.push(set("key_mgmt", "SAE".into()));
-            commands.push(set("sae_password", hex::encode(password)));
-            commands.push(set("ieee80211w", "2".into()));
-        }
-        Security::PskSae => {
-            commands.push(set("key_mgmt", "WPA-PSK WPA-PSK-SHA256 SAE".into()));
-            commands.push(set("psk", psk()?));
-            commands.push(set("sae_password", hex::encode(password)));
-            commands.push(set("ieee80211w", "1".into()));
-        }
-        Security::Wep | Security::Enterprise => bail!("the recovery does not join a network protected so"),
+    for (name, value) in network_values(security, password)? {
+        commands.push(format!("SET_NETWORK {id} {name} {value}"));
     }
     Ok(commands)
+}
+
+/// The same as a block of the settings file, where the networks joined
+/// before are put for the supplicant to join one of them on its own. The
+/// name is scanned for, which hidden networks answer.
+pub fn network_block(ssid: &[u8], security: Security, password: &str) -> Result<String> {
+    let mut block = format!("network={{\nssid={}\nscan_ssid=1\n", hex::encode(ssid));
+    for (name, value) in network_values(security, password)? {
+        block.push_str(&format!("{name}={value}\n"));
+    }
+    block.push_str("}\n");
+    Ok(block)
 }
 
 /// What the supplicant tells a control connection attached to it.
@@ -340,6 +352,26 @@ mod control {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The settings of a network read from the file stand for the same
+    /// ones the control interface takes, whatever the protection.
+    #[test]
+    fn a_block_carries_what_the_commands_carry() {
+        for security in [Security::Open, Security::Owe, Security::Psk, Security::Sae, Security::PskSae] {
+            let block = network_block(b"home", security, "the password").expect("the password is one the supplicant takes");
+            assert!(block.starts_with("network={\n") && block.ends_with("}\n"));
+            for (name, value) in network_values(security, "the password").unwrap() {
+                assert!(block.contains(&format!("{name}={value}")), "no {name}={value} in the block:\n{block}");
+            }
+        }
+    }
+
+    /// A protection the recovery does not join makes no block either.
+    #[test]
+    fn a_network_protected_so_makes_no_block() {
+        assert!(network_block(b"home", Security::Wep, "").is_err());
+        assert!(network_block(b"home", Security::Enterprise, "").is_err());
+    }
 
     #[test]
     fn security_is_read_from_the_flags_a_scan_gives() {

@@ -22,6 +22,7 @@ use crate::widgets::{self, Caption, Detail, Fact, Outline, Row, Spec, SystemCard
 use skyward_info::{DeviceInfo, VERSION};
 use skyward_install::{Outcome, Reflash, Refusal, Stage};
 use skyward_net::download::Progress;
+use skyward_net::saved::Saved;
 use skyward_net::supplicant::Security;
 use skyward_net::wlan::{Bands, Network, Power, Stage as Joining};
 use skyward_systems::{Held, Who};
@@ -2921,6 +2922,42 @@ pub fn wlan(cx: &Ctx) -> Frame {
                     y = widgets::footnote(&mut c, t, f, y, &note);
                 }
             }
+            // What the phone holds stands under the one chosen, as the
+            // stock page stands its saved networks: each joined with what
+            // is held where it still answers a scan, and told of where it
+            // does not.
+            let joined_ssid = w.joined.as_ref().map(|j| &j.ssid);
+            let held: Vec<&Saved> = s.saved.iter().filter(|h| joined_ssid.is_none_or(|ssid| ssid != &h.ssid)).collect();
+            if !held.is_empty() {
+                y = widgets::section(&mut c, t, f, y, l.pick(SAVED_WLAN));
+                let names: Vec<String> = held.iter().map(|h| String::from_utf8_lossy(&h.ssid).into_owned()).collect();
+                let tags: Vec<Option<String>> = held
+                    .iter()
+                    .map(|h| w.networks.iter().find(|n| n.ssid == h.ssid).and_then(|n| fmt::band_tag(n.bands)))
+                    .collect();
+                let rows: Vec<Row> = held
+                    .iter()
+                    .zip(&names)
+                    .zip(&tags)
+                    .map(|((h, name), tag)| {
+                        let found = w.networks.iter().find(|n| n.ssid == h.ssid);
+                        let row = Row::new(name)
+                            .fan(found.map_or(0, |n| fmt::signal_level(n.signal)))
+                            .trail(Trail::Network { locked: !matches!(h.security, Security::Open | Security::Owe) });
+                        match tag {
+                            Some(tag) => row.tag(tag),
+                            None => row,
+                        }
+                    })
+                    .collect();
+                let kept = widgets::list(&mut c, t, f, y, &rows);
+                let picks: Vec<Action> = (0..held.len()).map(Action::JoinSaved).collect();
+                out.extend(hits(&kept.rows, &picks));
+                for (k, rect) in kept.rows.iter().enumerate() {
+                    out.push(Hit { rect: widgets::round_button(t, *rect), action: Action::SavedDetails(k) });
+                }
+                y = kept.bottom;
+            }
             let others: Vec<(usize, &Network)> =
                 w.networks.iter().enumerate().filter(|(_, n)| w.joined.as_ref().is_none_or(|j| j.ssid != n.ssid)).collect();
             let nearby = l.pick(["选取附近的 WLAN", "選擇附近的 Wi-Fi 網路", "Choose a nearby network"]);
@@ -2962,6 +2999,7 @@ pub fn wlan(cx: &Ctx) -> Frame {
 }
 
 const ADD_NETWORK: Text = ["添加网络", "新增網路", "Add network"];
+const SAVED_WLAN: Text = ["已保存的 WLAN", "已儲存的 Wi-Fi 網路", "Saved networks"];
 const SHOW_PASSWORD: Text = ["显示密码", "顯示密碼", "Show password"];
 const CONNECT_KEY: Text = ["连接", "連線", "Connect"];
 const SECURITY: Text = ["安全性", "安全性", "Security"];
@@ -3045,13 +3083,24 @@ pub fn wlan_network(cx: &Ctx) -> Frame {
     let signal = l.pick(["信号强度", "訊號強度", "Signal strength"]);
     let title = l.pick(["网络详情", "網路詳細資料", "Network details"]);
     let Some(j) = joined else {
-        let items = [
-            detail(Outline::Wifi, l.pick(["频段", "頻段", "Bands"]), fmt::bands(l, network.bands)),
-            detail(Outline::Signal, signal, fmt::signal(l, network.signal).to_string()),
-            security,
-        ];
+        // The rows of a scan speak of where the network stands: a network
+        // the scan no longer answers, or never did, is told of by its
+        // protection alone. What the phone holds is what its page takes
+        // away.
+        let scanned = s.wlan.as_ref().is_some_and(|w| w.networks.iter().any(|n| n.ssid == network.ssid));
+        let mut items = Vec::new();
+        if scanned {
+            items.push(detail(Outline::Wifi, l.pick(["频段", "頻段", "Bands"]), fmt::bands(l, network.bands)));
+            items.push(detail(Outline::Signal, signal, fmt::signal(l, network.signal).to_string()));
+        }
+        items.push(security);
         let y = widgets::detail_grid(&mut c, t, f, y, &items);
-        return Frame::new(t, fit(c, t, y), out, title, top);
+        if !s.saved.iter().any(|h| h.ssid == network.ssid) {
+            return Frame::new(t, fit(c, t, y), out, title, top);
+        }
+        let forget = widgets::list(&mut c, t, f, y + t.m.card_gap, &[Row::new(l.pick(["删除网络", "刪除網路", "Forget network"])).tint(t.pal.danger).trail(Trail::None)]);
+        out.extend(hits(&forget.rows, &[Action::LeaveNetwork]));
+        return Frame::new(t, fit(c, t, forget.bottom), out, title, top);
     };
     let mut items = vec![detail(Outline::Info, l.pick(["状态信息", "狀態資訊", "Status"]), fmt::joining(l, &j.stage).to_string())];
     match &j.stage {

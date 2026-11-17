@@ -130,6 +130,10 @@ probe = "http://connect.rom.miui.com/generate_204"
 # driver is in, which its user would wait at the switch: it is brought up
 # as the recovery starts instead.
 prewarm = true
+# Told the chip as the supplicant starts. Where none is told it keeps the
+# world-safe channels, which hold none of the higher 5 GHz ones a router
+# here sits on, so a network on one of those is never reached.
+country = "CN"
 
 # The update server the stock updater of the Chinese system asks.
 [update]

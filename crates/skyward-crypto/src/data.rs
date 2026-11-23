@@ -325,10 +325,6 @@ fn made_up(user: u32, id: &str) -> bool {
 const SHARED_KEY: &str = "/data/unencrypted/key";
 const SHARED_NAME: &str = "/data/unencrypted/ref";
 const FILE_MODE: &str = "/data/unencrypted/mode";
-/// Where the phone's system keeps the keys of the files it encrypted one by
-/// one: a partition given no such folder was never encrypted that way.
-const KEY_FOLDER: &str = "/data/unencrypted";
-
 /// Where the phone keeps each user's own keys.
 const USER_KEYS: &str = "/data/misc/vold/user_keys";
 

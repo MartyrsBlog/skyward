@@ -2499,7 +2499,7 @@ pub fn wlan(cx: &Ctx) -> Frame {
             let joined_ssid = w.joined.as_ref().map(|j| &j.ssid);
             let held: Vec<&Saved> = s.saved.iter().filter(|h| joined_ssid.is_none_or(|ssid| ssid != &h.ssid)).collect();
             if !held.is_empty() {
-                y = widgets::section(&mut c, t, f, y, l.pick(SAVED_WLAN));
+                y = widgets::section(&mut c, t, f, y, l.pick(texts::wlan::SAVED_NETWORKS));
                 let names: Vec<String> = held.iter().map(|h| String::from_utf8_lossy(&h.ssid).into_owned()).collect();
                 let tags: Vec<Option<String>> = held
                     .iter()
@@ -2565,8 +2565,6 @@ pub fn wlan(cx: &Ctx) -> Frame {
     }
     Frame::new(t, fit(c, t, y), out, l.pick(texts::page::WLAN), top)
 }
-
-const SAVED_WLAN: Text = ["已保存的 WLAN", "已儲存的 Wi-Fi 網路", "Saved networks"];
 
 /// The password of the network chosen: its name, what is typed, a switch
 /// to show it, and the keyboard.

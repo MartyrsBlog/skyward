@@ -523,12 +523,7 @@ fn module_folders(cfg: &DeviceConfig) -> Result<Vec<PathBuf>> {
 
 /// Load `names` from the module sources the configuration lists.
 fn load_modules(cfg: &DeviceConfig, names: &[String]) -> Result<Vec<PathBuf>> {
-    skyward_modules::load(&module_dirs(cfg)?, names)
-}
-
-/// The folders the configuration's module sources name.
-fn module_dirs(cfg: &DeviceConfig) -> Result<Vec<PathBuf>> {
-    cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect()
+    skyward_modules::load(&module_folders(cfg)?, names)
 }
 
 /// The folder the phone's vendor modules are in, laying out the partition
@@ -615,7 +610,7 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
             Err(e) => skyward_sys::kmsg(&format!("the phone's vendor modules are not mounted: {e:#}"))?,
         }
     }
-    let (loaded, missing) = skyward_modules::load_each(&module_dirs(cfg)?, &cfg.modules.load);
+    let (loaded, missing) = skyward_modules::load_each(&module_folders(cfg)?, &cfg.modules.load);
     for path in loaded {
         skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
     }
@@ -650,7 +645,7 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     if let Some(wlan) = &cfg.wlan
         && wlan.prewarm
     {
-        let dirs = module_dirs(cfg)?;
+        let dirs = module_folders(cfg)?;
         let wlan = wlan.clone();
         std::thread::spawn(move || match wlan::prewarm(&wlan, &dirs) {
             Ok(()) => { let _ = skyward_sys::kmsg("the WLAN's chip is up ahead of its switch"); }

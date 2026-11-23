@@ -9,4 +9,6 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
 libc = { workspace = true }

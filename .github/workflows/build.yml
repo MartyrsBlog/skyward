@@ -101,7 +101,9 @@ jobs:
             test -f "devices/$DEVICE.toml"
             echo "devices=$(jq -nc --arg device "$DEVICE" '[$device]')" >> "$GITHUB_OUTPUT"
           else
-            echo "devices=$(basename -s .toml devices/*.toml | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+            # This fork carries one phone's port; every other device is built
+            # by the project it is forked from.
+            echo 'devices=["diting"]' >> "$GITHUB_OUTPUT"
           fi
 
   recovery:
@@ -147,9 +149,24 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ]; then version="$GITHUB_REF_NAME"; else version="${GITHUB_SHA::7}"; fi
           name="skyward-$version-$DEVICE-$STOCK"
           mkdir out
+          # A configuration that names the folder by the version the stock
+          # image is of gets the directories kept beside the sources: a HIDL
+          # service registers only with one of its own version.
+          sdk=$(tools/skyward-pack cat stock/recovery.img prop.default |
+            sed -n 's/^ro\.vendor\.build\.version\.sdk=//p' | head -1)
+          test -n "$sdk"
+          extra=()
+          if grep -q '{sdk}' "devices/$DEVICE.toml"; then
+            for lib in companion/a"$sdk"/lib/*.so; do
+              extra+=(--extra "$lib:skyward/hidl/a$sdk/lib/$(basename "$lib")")
+            done
+            for program in servicemanager hwservicemanager; do
+              extra+=(--extra "companion/a$sdk/$program:skyward/hidl/a$sdk/$program:0755")
+            done
+          fi
           tools/skyward-pack recovery --stock stock/recovery.img --binary tools/skyward --system-init tools/system-init \
             --config "devices/$DEVICE.toml" --font resources/fonts/MiSansVF.ttf --mono resources/fonts/KirkMono-Regular.ttf \
-            --mono-license resources/fonts/KirkMono-OFL.txt --out "out/$name.img"
+            --mono-license resources/fonts/KirkMono-OFL.txt "${extra[@]}" --out "out/$name.img"
           echo "name=$name" >> "$GITHUB_OUTPUT"
       # The image is the whole partition, flashed as it is, and most of it
       # is the room the recovery leaves empty; it is handed out zipped.
@@ -188,18 +205,72 @@ jobs:
         working-directory: images
         run: sha256sum -- *.zip > SHA256SUMS
       # Each zip shows on the release as the phone it is for, its model and
-      # then its codename, which is how people look for theirs; a device
-      # whose zip is missing stops the release.
+      # then its codename, which is how people look for theirs. The zips are
+      # walked rather than the device list, since a build may make only some.
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           zips=()
-          for config in devices/*.toml; do
-            device=$(basename "$config" .toml)
+          for zip in images/skyward-"$GITHUB_REF_NAME"-*.zip; do
+            name=$(basename "$zip" .zip)
+            rest=${name#"skyward-$GITHUB_REF_NAME-"}
+            device=${rest%%-*}
+            config="devices/$device.toml"
+            test -f "$config"
             model=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["device"]["model"])' "$config")
-            zip=$(ls images/skyward-"$GITHUB_REF_NAME"-"$device"-*.zip)
             zips+=("$zip#$model ($device)")
           done
+          test "${#zips[@]}" -gt 0
           gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes "${zips[@]}" images/SHA256SUMS
+
+  # The project publishes on a version tag; this fork makes no version of its
+  # own, so a build is published by hand under the commit it was made from.
+  publish:
+    name: Publish the build
+    if: github.event_name == 'workflow_dispatch'
+    needs: [check, recovery]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: skyward-*
+          path: images
+          merge-multiple: true
+          skip-decompress: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          tag="diting-${SHA:0:7}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "the release for $tag is already there" >&2
+            exit 1
+          fi
+          (cd images && sha256sum -- *.zip > SHA256SUMS)
+          cat > notes.md <<'TEXT'
+          从这次提交构建，基底是官方 `OS3.0.2.0.VLFCNXM` 全量包里的 recovery 分区。镜像里带了 vendor 同代
+          （Android 12 / SDK 31）的两个服务目录与依赖库，位于 `/skyward/hidl/a31/`。
+
+          刷入当前槽即可，另一个槽保持原样，要回去就把原来的 recovery 刷回去：
+
+          ```
+          fastboot flash recovery_a <解压出来的 .img>
+          fastboot reboot recovery
+          ```
+
+          刷 recovery 不动 `boot`，KernelSU 不受影响。
+          TEXT
+          # A build by hand is a pre-release: it carries no version, and the
+          # recovery asks for the newest release proper when it looks for one.
+          gh release create "$tag" images/*.zip images/SHA256SUMS \
+            --target "$SHA" \
+            --prerelease \
+            --title "Skyward for diting (${SHA:0:7})" \
+            --notes-file notes.md

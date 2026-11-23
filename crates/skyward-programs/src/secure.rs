@@ -162,11 +162,10 @@ enum Ready {
 
 /// What to do, in order: start the listeners and the openers of the secure
 /// world, the key service, the directory for hardware services where the
-/// phone has services of the older kind, and the credential service; on a
-/// phone with a weaver, load the driver its secure element takes, start
-/// what the weaver reaches its secure element through, serving Android's
-/// secure element service where that is what it goes through, and the
-/// weaver; and start the boot control.
+/// phone's own scripts name one, and the credential service; on a phone
+/// with a weaver, start what the weaver reaches its secure element
+/// through, serving Android's secure element service where that is what it
+/// goes through, and the weaver; and start the boot control.
 pub fn steps(phone: &Phone) -> Result<Vec<Step>> {
     let mut out = Vec::new();
     let start = |out: &mut Vec<Step>, started: Started| out.push(Step::Start(Box::new(started)));
@@ -186,12 +185,14 @@ pub fn steps(phone: &Phone) -> Result<Vec<Step>> {
 
     let (credentials, credentials_kind) = offered(phone, CREDENTIALS).context("the phone describes no credential service")?;
     let (boot, boot_kind) = offered(phone, BOOT).context("the phone describes no boot control")?;
-    if credentials_kind == Kind::Hidl || boot_kind == Kind::Hidl {
-        let directory = phone
-            .programs
-            .iter()
-            .find(|p| p.name == HARDWARE_DIRECTORY && phone.carries(p))
-            .context("the phone has hardware services of the older kind, and no directory for them among the programs its scripts name")?;
+    // The directory of the older kind is started where the phone's scripts
+    // name one it carries. Android keeps the script of the one every phone
+    // has beside the rest of its framework, on the system partition, which
+    // a recovery does not read for the phone's programs: such a phone has
+    // the directory the recovery carries, started before these.
+    if (credentials_kind == Kind::Hidl || boot_kind == Kind::Hidl)
+        && let Some(directory) = phone.programs.iter().find(|p| p.name == HARDWARE_DIRECTORY && phone.carries(p))
+    {
         start(&mut out, started(phone, directory, Ready::Property(HARDWARE_DIRECTORY_READY), Vec::new()));
     }
     let ready = |name: String, kind: Kind| match kind {

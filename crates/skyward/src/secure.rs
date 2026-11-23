@@ -33,7 +33,6 @@ const PHONE_DESCRIPTION: &str = "phone.xml";
 
 /// The name init knows the service directory by, and the program it runs.
 const DIRECTORY_SERVICE: &str = "servicemanager";
-const DIRECTORY_PROGRAM: &str = "/system/bin/servicemanager";
 
 /// Where init says which process each of its services runs as, one
 /// property per service, the service's name following this.
@@ -54,8 +53,107 @@ const BUNDLE_LOADER: &str = "bin/linker64";
 
 /// Which programs may register which hardware services, and where the
 /// directory for those services looks for that.
-const SERVICE_LABELS: &str = "/mnt/system/system/etc/selinux/plat_hwservice_contexts";
+const SERVICE_LABELS: [&str; 2] = [
+    "/mnt/system/system/etc/selinux/plat_hwservice_contexts",
+    "/mnt/system/system/etc/selinux/plat_service_contexts",
+];
 const RECOVERY_LABELS: &str = "/system/etc/selinux";
+
+/// The binder drivers' own filesystem. A phone whose kernel keeps the driver
+/// a module, as this one does, has no nodes until something mounts it: a
+/// stock recovery mounts none of it, and its init starts no service that
+/// would.
+const BINDERFS: &str = "/dev/binderfs";
+
+/// The nodes the phone's programs open, each inside the driver's filesystem.
+const BINDER_NODES: [&str; 3] = ["binder", "vndbinder", "hwbinder"];
+
+/// Mount the driver's filesystem where it is not mounted yet, and put the
+/// nodes the phone's programs open at the names they ask for. Best effort:
+/// a kernel that has no driver leaves the recovery as it was.
+pub fn ensure_binder_nodes() {
+    let dir = Path::new(BINDERFS);
+    if !dir.exists() {
+        if fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        // SAFETY: the three strings outlive the call, and mount reads them only.
+        let made = unsafe { libc::mount(c"binder".as_ptr(), c"/dev/binderfs".as_ptr(), c"binder".as_ptr(), 0, std::ptr::null()) };
+        if made != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::EBUSY) {
+            return;
+        }
+    }
+    for name in BINDER_NODES {
+        let node = Path::new("/dev").join(name);
+        let inside = dir.join(name);
+        if !node.exists() && inside.exists() {
+            let _ = std::os::unix::fs::symlink(&inside, &node);
+        }
+        if node.exists() {
+            let _ = fs::set_permissions(&node, std::os::unix::fs::PermissionsExt::from_mode(0o666));
+        }
+    }
+}
+
+/// The directories the phone's own services register with, as the installed
+/// system carries them. A recovery's image may carry neither: the phone's
+/// programs still need one, so the recovery starts these itself.
+const DIRECTORY_ROOT: &str = "/skyward/hidl";
+
+/// The version the phone's vendor image names, read where its own build
+/// properties are: the programs in it were built against that version.
+fn vendor_sdk() -> Option<u32> {
+    let text = fs::read_to_string("/vendor/build.prop").ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("ro.vendor.build.version.sdk="))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// The folder of service directories of that version, where the recovery
+/// carries them. A phone whose installed system is the version its vendor
+/// image is needs none: the installed system's own directory serves.
+fn companion() -> Option<PathBuf> {
+    let dir = Path::new(DIRECTORY_ROOT).join(format!("a{}", vendor_sdk()?));
+    dir.is_dir().then_some(dir)
+}
+
+/// The libraries a companion program of that version is built against.
+pub fn companion_libraries() -> Option<PathBuf> {
+    companion().map(|dir| dir.join("lib"))
+}
+
+/// The programs to try as one of the two service directories, the one that
+/// matches the phone's own services first: a directory of another version
+/// takes no registration from them, and answers none of their lookups.
+fn directory_programs(name: &str, fallbacks: &[&str]) -> Vec<String> {
+    let mut programs = Vec::new();
+    if let Some(dir) = companion() {
+        programs.push(dir.join(name).display().to_string());
+    }
+    programs.extend(fallbacks.iter().map(|fallback| fallback.to_string()));
+    programs
+}
+
+fn directory_kinds() -> [(String, Vec<String>); 2] {
+    [
+        ("servicemanager".to_string(), directory_programs("servicemanager", &["/system/bin/servicemanager", "/mnt/system/system/bin/servicemanager"])),
+        ("hwservicemanager".to_string(), directory_programs("hwservicemanager", &["/system/bin/hwservicemanager", "/mnt/system_ext/bin/hwservicemanager"])),
+    ]
+}
+
+/// The libraries to start a directory with: one the recovery carries of its
+/// own version keeps to that version's libraries.
+fn directory_libraries_for(program: &str) -> Result<String> {
+    match companion() {
+        // A directory the recovery carries comes with the libraries of its own
+        // version, and must not be given the installed system's first: those
+        // are of another version, and a program of this one stops as it starts.
+        Some(dir) if Path::new(program).starts_with(&dir) => {
+            Ok(format!("{}/lib:/system/lib64:/vendor/lib64", dir.display()))
+        }
+        _ => directory_libraries(),
+    }
+}
 
 /// The driver the phone's hardware services talk over, as they expect to
 /// find it and as a recovery has it.
@@ -65,6 +163,14 @@ const HARDWARE_DRIVER_NODE: &str = "/dev/binderfs/hwbinder";
 /// The directory for those services is itself one of them, and it turns
 /// itself off when the running system does not describe it.
 const HARDWARE_DIRECTORY: &str = "android.hidl.manager@1.2::IServiceManager/default";
+
+/// The name the phone's init knows that directory's program by, which is
+/// also how the two directories are told apart here, and the property it
+/// sets once it takes registrations: on the phone init waits for it before
+/// it starts a service of that kind, which is turned away and ends where
+/// it comes first.
+const HARDWARE_DIRECTORY_PROGRAM: &str = "hwservicemanager";
+const HARDWARE_DIRECTORY_READY: &str = "hwservicemanager.ready";
 
 /// What says the directory is off. It is read by the services, and in a
 /// recovery there is nothing else to set it.
@@ -85,6 +191,7 @@ const RECOVERY_MANIFEST: &str = "/system/etc/vintf/manifest.xml";
 ///
 /// `wanted` names the hardware services that will be asked for.
 pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
+    ensure_binder_nodes();
     // A loader and the lowest libraries are built together and agree
     // between them on how a program's own storage is laid out, so the
     // installed system's programs are loaded by the installed system's
@@ -116,15 +223,25 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     // as the users their init scripts name.
     fs::set_permissions(driver, std::os::unix::fs::PermissionsExt::from_mode(0o666))
         .with_context(|| format!("open {HARDWARE_DRIVER} to every program"))?;
-    let from = Path::new(SERVICE_LABELS);
-    let into = Path::new(RECOVERY_LABELS).join(from.file_name().expect("a named file"));
     fs::create_dir_all(RECOVERY_LABELS).with_context(|| format!("make {RECOVERY_LABELS}"))?;
     // The directory reads both of these as the user its init script names,
     // and what the recovery makes under its own umask is root's alone: they
     // are given the modes the system's own copies have.
     fs::set_permissions(RECOVERY_LABELS, std::os::unix::fs::PermissionsExt::from_mode(0o755))
         .with_context(|| format!("open {RECOVERY_LABELS} to every user"))?;
-    fs::copy(from, &into).with_context(|| format!("copy {} to {}", from.display(), into.display()))?;
+    // The directories label the services they hand out from these, and turn
+    // away a lookup of one they cannot label: a recovery carries neither,
+    // and starts a directory from the installed system, so its own copies
+    // come along.
+    for from in SERVICE_LABELS.map(Path::new) {
+        let into = Path::new(RECOVERY_LABELS).join(from.file_name().expect("a named file"));
+        fs::copy(from, &into).with_context(|| format!("copy {} to {}", from.display(), into.display()))?;
+    }
+    // A recovery ramdisk need not keep the folder the manifest goes in: a stock
+    // recovery describes no hardware service, so its image leaves it out.
+    if let Some(dir) = Path::new(RECOVERY_MANIFEST).parent() {
+        fs::create_dir_all(dir).with_context(|| format!("make {}", dir.display()))?;
+    }
     fs::write(RECOVERY_MANIFEST, describe_hardware(wanted)?).with_context(|| format!("write {RECOVERY_MANIFEST}"))?;
     fs::set_permissions(RECOVERY_MANIFEST, std::os::unix::fs::PermissionsExt::from_mode(0o644))
         .with_context(|| format!("let every user read {RECOVERY_MANIFEST}"))?;
@@ -132,6 +249,13 @@ pub fn prepare_hardware_directory(wanted: &[String]) -> Result<()> {
     // description, and a run of it before this was written may have left
     // that behind.
     skyward_sys::set_prop(DIRECTORY_OFF, "false")?;
+    // What was described above is what a directory of the older kind
+    // starts on: it is started here, so that the phone's services of that
+    // kind find one waiting when they are started.
+    match start_directories() {
+        Ok(()) => skyward_sys::kmsg("the directories the phone's services register with are running")?,
+        Err(e) => skyward_sys::kmsg(&format!("the directory for the phone's hardware services is not up: {e:#}"))?,
+    }
     Ok(())
 }
 
@@ -193,6 +317,113 @@ fn image(file: &Path) -> Result<(u64, u64)> {
     Ok((start, entry.size()))
 }
 
+/// The service directory running now, whichever name its program has.
+fn running_directory() -> Option<u32> {
+    directory_kinds()
+        .into_iter()
+        .flat_map(|(_, programs)| programs)
+        .find_map(|program| crate::services::running(&program))
+}
+
+/// The libraries the installed system's own programs are built against, in
+/// the order the phone's own init gives them.
+fn directory_libraries() -> Result<String> {
+    let mut dirs = vec!["/mnt/system_ext/lib64".to_string(), "/mnt/system/system/lib64".to_string()];
+    if let Some(dir) = libraries()? {
+        dirs.push(dir.display().to_string());
+    }
+    dirs.push("/system/lib64".to_string());
+    dirs.push("/vendor/lib64".to_string());
+    Ok(dirs.join(":"))
+}
+
+/// Start the directories where the recovery carries none: the phone's own
+/// programs register with them, and without one nothing that uses the
+/// phone's keys can come up.
+fn start_directories() -> Result<()> {
+    let mut hardware = false;
+    for (name, programs) in directory_kinds() {
+        let Some(program) = programs.iter().find(|p| Path::new(p.as_str()).is_file()).cloned() else { continue };
+        hardware |= name == HARDWARE_DIRECTORY_PROGRAM;
+        if crate::services::running(&program).is_some() {
+            continue;
+        }
+        let libs = directory_libraries_for(&program)?;
+        // The installed system's own directory is built from its own
+        // libbinder, which marks calls differently from the recovery's.
+        skyward_binder::parcel::speak_the_system_dialect();
+        if name == HARDWARE_DIRECTORY_PROGRAM {
+            // A run before this one, ended to start this one, leaves the
+            // property saying it was ready: the one about to start says so
+            // again once it takes registrations.
+            let _ = skyward_sys::set_prop(HARDWARE_DIRECTORY_READY, "false");
+        }
+        match std::process::Command::new(&program)
+            .env("LD_LIBRARY_PATH", &libs)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(_) => skyward_sys::kmsg(&format!("{program}: the service directory started"))?,
+            Err(e) => skyward_sys::kmsg(&format!("{program}: the service directory did not start: {e}"))?,
+        }
+    }
+    if hardware {
+        wait_for_hardware_directory();
+    }
+    let binder = skyward_binder::driver::Binder::open()?;
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        match skyward_binder::service::find(&binder, "android.os.IServiceManager") {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                ensure!(Instant::now() < until, "the service directory does not answer: {e:#}");
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Wait until the directory for hardware services takes registrations, as
+/// the phone's init waits for it. A directory that never says so leaves
+/// the services of the older kind to end where they start, which the log
+/// then tells of rather than the boot being held up.
+fn wait_for_hardware_directory() {
+    let until = Instant::now() + Duration::from_secs(5);
+    let ready = loop {
+        if skyward_sys::prop(HARDWARE_DIRECTORY_READY).is_some_and(|value| value == "true") {
+            break true;
+        }
+        if Instant::now() >= until {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let said = match ready {
+        true => "the directory for the phone's hardware services takes registrations",
+        false => "the directory for the phone's hardware services does not say it takes registrations",
+    };
+    let _ = skyward_sys::kmsg(said);
+}
+
+/// Start the directory again after its descriptions changed: init runs no
+/// service of that name on every phone, so the one started here is ended
+/// and started again by hand.
+fn restart_directories() -> Result<()> {
+    for (_, programs) in directory_kinds() {
+        let Some(program) = programs.iter().find(|p| Path::new(p.as_str()).is_file()).cloned() else { continue };
+        let Some(pid) = crate::services::running(&program) else { continue };
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        let until = Instant::now() + Duration::from_secs(5);
+        while crate::services::running(&program).is_some() {
+            ensure!(Instant::now() < until, "{program}, pid {pid}, does not end");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    start_directories()
+}
+
 /// Tell the phone's service directory of the services in `wanted`, which
 /// the phone's own programs register and the recovery itself may serve.
 /// The directory turns away a hardware service the running system does
@@ -233,6 +464,7 @@ pub fn publish_descriptions(wanted: &[String]) -> Result<()> {
     // these. One an earlier run of the recovery service had start again
     // knows them already, and is left with what has registered with it
     // since.
+    start_directories()?;
     let binder = skyward_binder::driver::Binder::open()?;
     // The first it does not know described settles that it starts again.
     let mut unknown = false;
@@ -248,8 +480,12 @@ pub fn publish_descriptions(wanted: &[String]) -> Result<()> {
         // those services again, as the installed system's init does
         // whenever its directory restarts.
         let registered = registered()?;
-        let was = crate::services::running(DIRECTORY_PROGRAM);
-        skyward_sys::set_prop("ctl.restart", DIRECTORY_SERVICE).context("have the service directory start again")?;
+        let was = running_directory();
+        if skyward_sys::prop("init.svc.servicemanager").is_some() {
+            skyward_sys::set_prop("ctl.restart", DIRECTORY_SERVICE).context("have the service directory start again")?;
+        } else {
+            restart_directories()?;
+        }
         answering_again(was)?;
         register_again(&registered)?;
     }
@@ -259,7 +495,7 @@ pub fn publish_descriptions(wanted: &[String]) -> Result<()> {
 /// What has registered with the service directory, each with the init
 /// service whose process serves it; the directory's own entry is left out.
 fn registered() -> Result<Vec<(String, String)>> {
-    let Some(directory) = crate::services::running(DIRECTORY_PROGRAM) else { return Ok(Vec::new()) };
+    let Some(directory) = running_directory() else { return Ok(Vec::new()) };
     let binder = skyward_binder::driver::Binder::open()?;
     let started = skyward_sys::props(SERVICE_PIDS);
     let mut out = Vec::new();
@@ -337,7 +573,7 @@ fn say_framework(dir: &Path) -> Result<usize> {
 fn answering_again(was: Option<u32>) -> Result<()> {
     let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let now = crate::services::running(DIRECTORY_PROGRAM);
+        let now = running_directory();
         // Looking the directory up in itself answers nothing, and that it
         // answers at all is the whole question.
         if now.is_some() && now != was && crate::services::reachable() {

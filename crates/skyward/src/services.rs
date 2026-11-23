@@ -19,6 +19,10 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Where the installed system keeps its own libraries, which a recovery
+/// built from older sources may not carry.
+const INSTALLED_LIBRARIES: &str = "/mnt/system/system/lib64";
+
 /// A program that ends sooner than this after starting waits this long
 /// before it is started again.
 const RESTART_DELAY: Duration = Duration::from_secs(1);
@@ -98,8 +102,15 @@ pub fn once(program: &Started) -> Result<ExitStatus> {
 }
 
 /// The accounts the phone knows, each by its name.
+/// The accounts the installed system's own list names, which a recovery's
+/// partitions need not carry: the programs started from those partitions
+/// run as the users their init scripts name.
+const INSTALLED_ACCOUNTS: [&str; 2] = ["/mnt/system/system/etc/passwd", "/mnt/system/system/etc/group"];
+
 fn accounts() -> HashMap<String, u32> {
-    ueventd::accounts(&ueventd::PASSWD_FILES.iter().chain(&ueventd::GROUP_FILES).copied().collect::<Vec<_>>())
+    let files: Vec<&str> =
+        ueventd::PASSWD_FILES.iter().chain(&ueventd::GROUP_FILES).chain(&INSTALLED_ACCOUNTS).copied().collect();
+    ueventd::accounts(&files)
 }
 
 /// What `program` is started with, worked out before it is: the program
@@ -112,6 +123,37 @@ fn readied(program: &Started, libraries: Option<&Path>, known: &HashMap<String, 
     }
     if let Some(dir) = libraries {
         s.libraries.push(dir.to_string_lossy().into_owned());
+    }
+    // A recovery is built from the sources of some Android version, and a
+    // hardware service from the installed system may need a library of its
+    // own that the recovery's copy is too old to carry. Only those are given
+    // the installed system's folder, searched after every folder the program
+    // names: the phone's own copies still come first, and the programs that
+    // are the phone's own (a shell, its daemons) keep to the libraries they
+    // were built against.
+    // A service of the older kind registers with a directory of the version it
+    // was built for, and turns to drivers of that version to reach it: where
+    // the recovery carries that version, it is searched before the phone's own
+    // folder. A service of the newer kind carries calls over the driver the
+    // installed system's own sources build, which the phone's older partitions
+    // do not have; only those are given the installed system's libraries.
+    if s.path.starts_with("/vendor/bin/hw/") {
+        let mut libs = Vec::new();
+        // A program of the phone's own is built against the version its
+        // vendor image is, and registers with the directory of that version:
+        // where the recovery carries those libraries, they come first. Only a
+        // phone whose recovery carries none falls back on the installed
+        // system's.
+        match crate::secure::companion_libraries() {
+            Some(dir) => libs.push(dir.display().to_string()),
+            None if Path::new(INSTALLED_LIBRARIES).is_dir() => libs.push(INSTALLED_LIBRARIES.to_string()),
+            None => {}
+        }
+        if !s.libraries.iter().any(|l| l == "/vendor/lib64") {
+            libs.push("/vendor/lib64".to_string());
+        }
+        libs.append(&mut s.libraries);
+        s.libraries = libs;
     }
     let who = Credentials::of(&s, known)?;
     let given = Given::of(program, known)?;
@@ -387,8 +429,11 @@ fn ready(s: &Service) -> Result<()> {
     };
     let until = Instant::now() + READY_TIMEOUT;
     loop {
+        // A property says a program is ready by being set at all, the
+        // phone's init counting a false one as unset: it sets some to
+        // false when the program starts again.
         if let Some(name) = &s.ready_property
-            && skyward_sys::prop(name).is_some_and(|v| !v.is_empty())
+            && skyward_sys::prop(name).is_some_and(|value| !value.is_empty() && value != "false" && value != "0")
         {
             return Ok(());
         }
@@ -412,19 +457,37 @@ fn ready(s: &Service) -> Result<()> {
 }
 
 fn supervise(s: &Service, who: &Credentials, given: &Given) -> ! {
+    // A program that ends at once is started again, as init does; what it
+    // says of each ending is kept to one line a while, so a program that
+    // keeps ending does not fill the phone's log. The wait before it is
+    // started again grows while it keeps ending at once: a program this
+    // phone cannot run here would otherwise be started every second for as
+    // long as the recovery runs. One that ran a while starts over.
+    let mut told = 0usize;
+    let mut last = Instant::now() - RESTART_DELAY;
+    let mut quick = 0u32;
     loop {
         let started = Instant::now();
         let ended = match running(&s.path) {
             Some(pid) => wait_for(pid).map(|()| format!("pid {pid}, left by an earlier recovery service, exited")),
             None => run(s, who, given),
         };
-        let line = match ended {
-            Ok(how) => format!("{}: {how}", s.path),
-            Err(e) => format!("{}: {e:#}", s.path),
-        };
-        let _ = skyward_sys::kmsg(&line);
+        told += 1;
+        if told == 1 || last.elapsed() >= RESTART_DELAY * 30 {
+            let line = match &ended {
+                Ok(how) => format!("{}: {how} ({told} so far)", s.path),
+                Err(e) => format!("{}: {e:#} ({told} so far)", s.path),
+            };
+            let _ = skyward_sys::kmsg(&line);
+            last = Instant::now();
+        }
         if started.elapsed() < RESTART_DELAY {
-            thread::sleep(RESTART_DELAY);
+            quick = quick.saturating_add(1);
+            let wait = (RESTART_DELAY * 2u32.saturating_pow(quick.min(6)))
+                .min(Duration::from_secs(60));
+            thread::sleep(wait);
+        } else {
+            quick = 0;
         }
     }
 }
@@ -448,7 +511,16 @@ fn run(s: &Service, who: &Credentials, given: &Given) -> Result<String> {
 /// searched after those it is given here.
 fn command(s: &Service, who: &Credentials, given: &Given, handed: &[(String, OwnedFd)]) -> Command {
     let mut cmd = Command::new(&s.path);
-    cmd.args(&s.args).current_dir("/").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.args(&s.args).current_dir("/").stdin(Stdio::null()).stdout(Stdio::null());
+    // What a program says as it starts is kept beside the recovery's own log:
+    // one that ends at once otherwise leaves no word of why.
+    let folder = Path::new(skyward_sys::LOG).parent().unwrap_or(Path::new("/")).join("services");
+    let _ = fs::create_dir_all(&folder);
+    let name = Path::new(&s.path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "program".into());
+    match fs::File::create(folder.join(format!("{name}.err"))) {
+        Ok(file) => cmd.stderr(Stdio::from(file)),
+        Err(_) => cmd.stderr(Stdio::null()),
+    };
     let mut libraries = s.libraries.clone();
     for (name, value) in &given.environment {
         match name == LIBRARY_PATH {

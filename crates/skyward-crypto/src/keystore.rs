@@ -25,6 +25,30 @@ const FN_KEY_BLOB: &str = "keymaster_key_blob";
 const FN_SECDISCARDABLE: &str = "secdiscardable";
 const FN_STRETCHING: &str = "stretching";
 
+/// The two words Android writes in the stretching file of a key it did not
+/// stretch: `nopassword` for a key its key service holds in hardware, and
+/// `none` for a key wrapped with the user's secret, which is how the key
+/// of a user who set a screen lock is kept. A build old enough to keep no
+/// such file at all stretched none either.
+const HARDWARE_HELD: &str = "nopassword";
+const SECRET_HELD: &str = "none";
+const UNSTRETCHED: [&str; 2] = [HARDWARE_HELD, SECRET_HELD];
+
+/// Whether the key in `dir` is wrapped with the user's secret, as the
+/// stretching file names it. A key the key service holds in hardware opens
+/// behind nothing the user knows, whatever the phone keeps about a
+/// credential: the phone may keep the state of a screen lock its owner has
+/// taken away.
+pub fn held_by_secret(dir: &Path) -> bool {
+    match fs::read_to_string(dir.join(FN_STRETCHING)) {
+        // A key the phone stretched is stretched with an algorithm of its
+        // own, which this does not carry; it is refused where the key
+        // itself is read, and counts as the hardware's here.
+        Ok(algorithm) => algorithm.trim() == SECRET_HELD,
+        Err(_) => true,
+    }
+}
+
 /// SHA-512 of `data` behind a fixed prefix.
 pub fn hash_with_prefix(prefix: &[u8], data: &[u8]) -> Vec<u8> {
     let mut padded = prefix.to_vec();
@@ -65,12 +89,26 @@ pub struct StoredKey {
 impl StoredKey {
     pub fn load(dir: &Path) -> Result<StoredKey> {
         let read = |name: &str| fs::read(dir.join(name)).with_context(|| format!("read {}", dir.join(name).display()));
-        let version = fs::read_to_string(dir.join(FN_VERSION)).with_context(|| format!("read {}", dir.join(FN_VERSION).display()))?;
+        let version = match fs::read_to_string(dir.join(FN_VERSION)) {
+            Ok(version) => version,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+                "{} holds no key: either the metadata partition did not come up, or the phone's system has not written one since it was last wiped. Start that system once, and where this stays, send what `ls -la {}/..` and the recovery's log say",
+                dir.display(),
+                dir.display()
+            ),
+            Err(e) => return Err(e).with_context(|| format!("read {}", dir.join(FN_VERSION).display())),
+        };
         if version.trim() != VERSION {
             bail!("{} is written in layout {}, Skyward reads layout {VERSION}", dir.display(), version.trim());
         }
-        if dir.join(FN_STRETCHING).exists() {
-            bail!("{} was written by an Android too old for Skyward to read", dir.display());
+        if let Ok(algorithm) = fs::read_to_string(dir.join(FN_STRETCHING)) {
+            // A key the phone stretched is stretched with an algorithm of
+            // its own, which this does not carry: only the two words
+            // Android writes for a key it left as it was are read on.
+            let algorithm = algorithm.trim();
+            if !UNSTRETCHED.contains(&algorithm) {
+                bail!("{} is stretched with {algorithm}, which Skyward does not read", dir.display());
+            }
         }
         let secdiscardable_hash = match dir.join(FN_SECDISCARDABLE).exists() {
             true => hash_with_prefix(SECDISCARDABLE_PREFIX, &read(FN_SECDISCARDABLE)?),
@@ -221,16 +259,53 @@ mod tests {
         assert!(s.unwrap(Unwrap::<NoService>::Secret(b"s")).is_err());
     }
 
+    /// A directory the phone's system has not written its key into yet has
+    /// no version file, which says so rather than that the phone is too
+    /// old or the key unreadable.
     #[test]
-    fn a_directory_in_an_older_layout_is_refused() {
-        let dir = tempdir("older-layout");
+    fn a_directory_the_system_has_not_written_yet_says_so() {
+        let dir = tempdir("not-written");
+        assert!(refusal(&dir).contains("holds no key"), "{}", refusal(&dir));
+    }
+
+    /// A key the phone stretched is stretched with an algorithm of its own,
+    /// which this does not carry. The words Android writes for a key it left
+    /// as it was are read on: `nopassword` for one its key service holds,
+    /// `none` for one wrapped with the user's secret, which is how the key
+    /// of a user who set a screen lock is kept.
+    #[test]
+    fn a_stretched_key_is_refused_and_an_unstretched_one_is_read() {
+        let dir = tempdir("stretching");
         fs::write(dir.join(FN_VERSION), "1").unwrap();
         fs::write(dir.join(FN_ENCRYPTED_KEY), [0u8; 64]).unwrap();
         fs::write(dir.join(FN_STRETCHING), "scrypt 15 8 1").unwrap();
-        assert!(refusal(&dir).contains("too old"), "{}", refusal(&dir));
+        assert!(refusal(&dir).contains("scrypt 15 8 1"), "{}", refusal(&dir));
+        for unstretched in UNSTRETCHED {
+            fs::write(dir.join(FN_STRETCHING), unstretched).unwrap();
+            assert!(StoredKey::load(&dir).is_ok(), "{} was refused", dir.display());
+        }
         fs::remove_file(dir.join(FN_STRETCHING)).unwrap();
         fs::write(dir.join(FN_VERSION), "2").unwrap();
         assert!(refusal(&dir).contains("layout 2"), "{}", refusal(&dir));
+    }
+
+    /// A key the key service holds in hardware is behind nothing the user
+    /// knows, whatever the phone keeps about a credential; one wrapped
+    /// with the user's secret needs it. The word for each is the
+    /// stretching file's own, and a key stretched with an algorithm of its
+    /// own counts as the hardware's here, for its refusal to come where
+    /// the key itself is read.
+    #[test]
+    fn the_stretching_file_says_whose_hand_the_key_is_in() {
+        let dir = tempdir("held-by");
+        fs::write(dir.join(FN_STRETCHING), HARDWARE_HELD).unwrap();
+        assert!(!held_by_secret(&dir));
+        fs::write(dir.join(FN_STRETCHING), SECRET_HELD).unwrap();
+        assert!(held_by_secret(&dir));
+        fs::write(dir.join(FN_STRETCHING), "scrypt 15 8 1").unwrap();
+        assert!(!held_by_secret(&dir));
+        fs::remove_file(dir.join(FN_STRETCHING)).unwrap();
+        assert!(held_by_secret(&dir));
     }
 
     #[test]

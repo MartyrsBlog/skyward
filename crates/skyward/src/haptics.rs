@@ -18,6 +18,10 @@ const FF_CUSTOM: u16 = 0x5d;
 /// full, whatever the slider says: the 17 Ultra's own system plays them at
 /// 3527 mV of the 8500 mV its device tree gives.
 const TICKS_STRENGTH: f32 = 0.415;
+/// The least of its drive some drivers take an effect at: this phone's own
+/// turns every lighter one down, its converter not running below half. A
+/// click lighter than that plays at the least the driver takes.
+const HALF_DRIVE: f32 = 0.5;
 /// How long the ticks stay loaded once their samples have run out, as the
 /// phone's own system leaves them: the motor comes to rest on its own
 /// before taking them away brakes it.
@@ -93,7 +97,17 @@ impl Haptics {
             erase(&self.dev, slot).context("take away the click still playing")?;
         }
         let effect = if ticks { &self.ticks } else { &self.click };
-        let loaded = upload(&self.dev, effect, share, self.scale_samples).context("load the click")?;
+        let loaded = match upload(&self.dev, effect, share, self.scale_samples) {
+            Ok(loaded) => loaded,
+            // A driver that takes no effect lighter than half its drive
+            // turns the lighter ones down rather than playing them weakly:
+            // the click plays at the least it takes, which is what its own
+            // system's lightest click is.
+            Err(e) if share < HALF_DRIVE => {
+                upload(&self.dev, effect, HALF_DRIVE, self.scale_samples).with_context(|| format!("load the click at the least its driver takes: {e:#}"))?
+            }
+            Err(e) => return Err(e).context("load the click"),
+        };
         play(&mut self.dev, loaded.slot).context("play the click")?;
         self.clicks += 1;
         let this = (loaded.slot, self.clicks);

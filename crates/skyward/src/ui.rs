@@ -1117,8 +1117,23 @@ pub fn run(cfg: &DeviceConfig, programs: &[Service], font: &Path, mono: &Path, r
     // A uevent may be a charger or a computer attached or taken away: the
     // battery is read at once, and the phone stays awake until it is.
     let uevents = uevent::Listener::open()?;
+    let mut said = None::<String>;
     loop {
-        pages.turn(&sleeper, &uevents)?;
+        // A turn that ends badly — a panel that will not take a commit, a
+        // frame that does not come — is told of and the loop goes on. The
+        // phone's own screen is the only way it can be told anything, and a
+        // recovery that has stopped drawing answers nothing at all.
+        match pages.turn(&sleeper, &uevents) {
+            Ok(()) => said = None,
+            Err(e) => {
+                let why = format!("{e:#}");
+                if said.as_deref() != Some(why.as_str()) {
+                    skyward_sys::kmsg(&format!("a turn of the screen ended: {why}"))?;
+                    said = Some(why);
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 }
 
@@ -1148,6 +1163,8 @@ struct Pages<'a> {
     /// adbd and fastbootd ask over it to go over to fastboot and back.
     control: Option<Control>,
     haptics: Option<Haptics>,
+    /// Said once a click the driver turned down, and no more.
+    motor_refused: bool,
     backlight: Backlight,
     keeper: Keeper,
     shown_clock: String,
@@ -1409,6 +1426,7 @@ impl<'a> Pages<'a> {
             touch_known: false,
             control,
             haptics,
+            motor_refused: false,
             backlight,
             keeper,
             shown_clock: String::new(),
@@ -1664,16 +1682,28 @@ impl<'a> Pages<'a> {
 
     /// One click of the motor, as strong as the settings say.
     fn click(&mut self) -> Result<()> {
-        if let Some(h) = &mut self.haptics {
-            h.click(self.app.state.vibration)?;
+        if let Some(h) = &mut self.haptics
+            && let Err(e) = h.click(self.app.state.vibration)
+        {
+            // A click the driver turns down costs its own tap, not the
+            // motor: the next may be one it takes. The first is said where
+            // its log is read from, and no more.
+            if !self.motor_refused {
+                skyward_sys::kmsg(&format!("the motor took no click, and is left trying: {e:#}"))?;
+                self.motor_refused = true;
+            }
         }
         Ok(())
     }
 
     /// The motor's ticks of the screen going off.
     fn ticks(&mut self) -> Result<()> {
-        if let Some(h) = &mut self.haptics {
-            h.ticks()?;
+        if let Some(h) = &mut self.haptics
+            && let Err(e) = h.ticks()
+            && !self.motor_refused
+        {
+            skyward_sys::kmsg(&format!("the motor took no ticks, and is left trying: {e:#}"))?;
+            self.motor_refused = true;
         }
         Ok(())
     }
@@ -2641,6 +2671,7 @@ impl Pages<'_> {
                 wlan_worker(&self.wlan)?.send(wlan::Command::Join { ssid, name, security, password: password.0 })
             }
             Effect::LeaveWlan => wlan_worker(&self.wlan)?.send(wlan::Command::Leave),
+            Effect::ForgetWlan { ssid } => wlan_worker(&self.wlan)?.send(wlan::Command::Forget { ssid }),
             Effect::CheckUpdate => self.check_update()?,
             Effect::Download(release) => self.download(release, now)?,
             Effect::StopDownload => self.downloader.as_ref().context("there is no download to stop")?.stop(),

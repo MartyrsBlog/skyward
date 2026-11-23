@@ -4,11 +4,13 @@
 //! stand each time that changes.
 
 use anyhow::{bail, ensure, Context, Result};
+use skyward_block::{fstab, mount};
 use skyward_config::{Firmware, Wlan as Config};
 use skyward_net::dhcp::{self, Kept, Lease};
 use skyward_net::http::Servers;
 use skyward_net::iface;
 use skyward_net::reach::{self, Reach};
+use skyward_net::saved;
 use skyward_net::supplicant::{self, Bss, Control, Event as Told, Security};
 use skyward_net::wlan::{self, Joined, Link, Next, Power, Stage, Traffic, Wlan};
 use skyward_sys::worker::{self, Teller};
@@ -64,6 +66,9 @@ pub enum Command {
     Off,
     Scan,
     Join { ssid: Vec<u8>, name: String, security: Security, password: String },
+    /// Leave the network joined, and take it from the ones the phone
+    /// holds, so that it is not joined again on its own.
+    Forget { ssid: Vec<u8> },
     Leave,
 }
 
@@ -106,7 +111,8 @@ impl Worker {
         let (inbox, asked) = worker::telling().context("make the WLAN thread's inbox")?;
         let back = inbox.clone();
         let worker = worker::Worker::start("wlan", move |tell| {
-            let mut s = Station { cfg, modules, libraries, servers, state: Wlan::default(), running: None, back, tell };
+            let mut s =
+                Station { cfg, modules, libraries, servers, state: Wlan::default(), running: None, seeded: Vec::new(), typed: None, back, tell };
             s.run(&asked);
         })?;
         Ok(Worker { inbox, worker })
@@ -200,6 +206,12 @@ struct Station {
     servers: Servers,
     state: Wlan,
     running: Option<Running>,
+    /// The networks the phone held when the supplicant started, each of
+    /// which it joins on its own.
+    seeded: Vec<saved::Saved>,
+    /// What was typed at the network being joined, kept until the access
+    /// point has agreed keys with it, for it to be written down then.
+    typed: Option<(Vec<u8>, Security, String)>,
     /// What a thread asking for an address, or looking how far the
     /// network reaches, answers to: the thread's own inbox.
     back: Teller<Inbox>,
@@ -259,6 +271,7 @@ impl Station {
             }
             Command::Join { ssid, name, security, password } => {
                 self.unaddress();
+                self.typed = Some((ssid.clone(), security, password.clone()));
                 let mut joined = Joined { ssid, name, security, stage: Stage::Joining };
                 if let Err(e) = self.join(&joined, &password) {
                     let _ = skyward_sys::kmsg(&format!("joining {} failed: {e:#}", joined.name));
@@ -266,8 +279,36 @@ impl Station {
                 }
                 self.state.joined = Some(joined);
             }
+            Command::Forget { ssid } => {
+                self.typed = None;
+                let joined_this = self.state.joined.as_ref().is_some_and(|j| j.ssid == ssid);
+                if joined_this {
+                    self.unaddress();
+                    if let Some(r) = &self.running
+                        && let Err(e) = r.control.order("REMOVE_NETWORK all")
+                    {
+                        self.lost(e);
+                    }
+                    self.state.joined = None;
+                }
+                // It is taken from what the supplicant was set up with as
+                // well, for it is not adopted again this start.
+                self.seeded.retain(|held| held.ssid != ssid);
+                match self.drop_network(&ssid) {
+                    Ok(()) => {
+                        let _ = skyward_sys::kmsg(&format!(
+                            "{} is taken from the networks the phone holds",
+                            String::from_utf8_lossy(&ssid)
+                        ));
+                    }
+                    Err(e) => {
+                        let _ = skyward_sys::kmsg(&format!("the network left is not taken from the ones the phone holds: {e:#}"));
+                    }
+                }
+            }
             Command::Leave => {
                 self.unaddress();
+                self.typed = None;
                 if let Some(r) = &self.running
                     && let Err(e) = r.control.order("REMOVE_NETWORK all")
                 {
@@ -297,9 +338,10 @@ impl Station {
         }
     }
 
-    fn start(&self) -> Result<Running> {
+    fn start(&mut self) -> Result<Running> {
         bring_up(&self.cfg, &self.modules)?;
-        let mut child = start_supplicant(&self.cfg, self.libraries.as_deref())?;
+        self.seeded = saved_networks();
+        let mut child = start_supplicant(&self.cfg, self.libraries.as_deref(), &self.seeded)?;
         let socket = Path::new(HOME).join("sockets").join(&self.cfg.interface);
         let connected = (|| -> Result<(Control, Control)> {
             let control = Control::open(&socket)?;
@@ -334,6 +376,7 @@ impl Station {
 
     fn off(&mut self) {
         self.unaddress();
+        self.typed = None;
         if let Some(mut r) = self.running.take() {
             end(&mut r.child, Some(&r.control));
         }
@@ -401,8 +444,26 @@ impl Station {
     }
 
     fn joining(&mut self, told: &Told) {
-        let Some(j) = &mut self.state.joined else { return };
-        match j.on(told) {
+        if self.state.joined.is_none() {
+            return self.adopt(told);
+        }
+        // What to write down once the access point has agreed keys with
+        // the network being joined, where a password was typed at it: the
+        // agreeing is where the password is known right.
+        let mut note = None;
+        let action = {
+            let Some(j) = &mut self.state.joined else { return };
+            let action = j.on(told);
+            if matches!(told, Told::Connected)
+                && matches!(j.stage, Stage::Addressing | Stage::Connected(_))
+                && let Some((ssid, security, password)) = &self.typed
+                && j.ssid == *ssid
+            {
+                note = Some(saved::Saved { ssid: ssid.clone(), security: *security, password: password.clone() });
+            }
+            action
+        };
+        match action {
             Next::Show => {}
             Next::Address => self.ask_address(),
             Next::Unaddress => self.unaddress(),
@@ -414,6 +475,63 @@ impl Station {
                 }
             }
         }
+        if let Some(network) = note {
+            match Self::keep(network) {
+                Ok(()) => {
+                    let _ = skyward_sys::kmsg("the network joined is kept for the next start");
+                }
+                Err(e) => {
+                    let _ = skyward_sys::kmsg(&format!("the network joined is not kept: {e:#}"));
+                }
+            }
+        }
+    }
+
+    /// Write a network the phone holds, on the partition the phone's own
+    /// boot may have left mounted read-only, which is made writable only
+    /// for the writing, as the settings are.
+    fn keep(network: saved::Saved) -> Result<()> {
+        skyward_vab::metadata_writable(true).context("make /metadata writable")?;
+        let wrote = saved::remember(&saved::folder(), network);
+        let back = skyward_vab::metadata_writable(false);
+        wrote?;
+        back
+    }
+
+    /// Take `ssid` from the networks the phone holds, the partition made
+    /// writable for the taking, as for the keeping.
+    fn drop_network(&mut self, ssid: &[u8]) -> Result<()> {
+        skyward_vab::metadata_writable(true).context("make /metadata writable")?;
+        let dropped = saved::forget(&saved::folder(), ssid);
+        let back = skyward_vab::metadata_writable(false);
+        dropped?;
+        back
+    }
+
+    /// A network the phone held has joined on its own, where the
+    /// supplicant says one is joined and the screen carries none yet: the
+    /// one joined is found among those the phone held, and carried as the
+    /// screen's own from there, its address asked for and all.
+    fn adopt(&mut self, told: &Told) {
+        if !matches!(told, Told::Connected) {
+            return;
+        }
+        let Some(r) = &self.running else { return };
+        let said = match r.control.ask("STATUS") {
+            Ok(said) => said,
+            Err(e) => return self.lost(e),
+        };
+        // The name the supplicant says it is joined to is read as the
+        // file's, where a name of bytes that are not characters is not
+        // found; the network stays joined all the same.
+        let joined = said.lines().find_map(|line| line.strip_prefix("ssid=").map(str::as_bytes));
+        let Some(held) = joined.and_then(|ssid| self.seeded.iter().find(|held| held.ssid == ssid)) else {
+            return;
+        };
+        let joined = Joined { ssid: held.ssid.clone(), name: String::from_utf8_lossy(&held.ssid).into_owned(), security: held.security, stage: Stage::Joining };
+        let _ = skyward_sys::kmsg(&format!("{} is joined as the phone holds it", joined.name));
+        self.state.joined = Some(joined);
+        self.joining(told);
     }
 
     /// Ask the network for an address, on a thread of its own.
@@ -621,6 +739,15 @@ impl Station {
 }
 
 /// Load the driver where its interface is not there yet, and bring the
+/// interface up, ahead of the switch: the chip's own coming up takes the
+/// better part of ten seconds, and a recovery may as well spend that while
+/// its user is still reading the screen. What this costs is the chip's
+/// power; what failing costs is the wait, not the WLAN.
+pub fn prewarm(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
+    bring_up(cfg, modules)
+}
+
+/// Load the driver where its interface is not there yet, and bring the
 /// interface up.
 fn bring_up(cfg: &Config, modules: &[PathBuf]) -> Result<()> {
     let net = Path::new("/sys/class/net").join(&cfg.interface);
@@ -672,8 +799,31 @@ fn place(file: &Firmware) -> Result<()> {
     }
 }
 
+/// The networks the phone holds, on the partition that outlives a start
+/// of the recovery. Nothing here stops the WLAN: where the partition does
+/// not come up, the phone starts with none of them, and the log says why.
+fn saved_networks() -> Vec<saved::Saved> {
+    let outcome = (|| -> Result<Vec<saved::Saved>> {
+        let at = Path::new("/metadata");
+        if !mount::is_mount_point(at)? {
+            let entry = fstab::partition("metadata")?.context("the phone's own table does not mount metadata")?;
+            let device = fstab::device(&entry)?;
+            fs::create_dir_all(at).with_context(|| format!("make {}", at.display()))?;
+            mount::mount(Path::new(&device), at, &entry.filesystem, &["rw".into(), "nosuid".into(), "nodev".into(), "noatime".into()])?;
+        }
+        saved::load(&saved::folder())
+    })();
+    match outcome {
+        Ok(networks) => networks,
+        Err(e) => {
+            let _ = skyward_sys::kmsg(&format!("the phone holds no saved networks: {e:#}"));
+            Vec::new()
+        }
+    }
+}
+
 /// Start the supplicant on the interface, and wait for its control socket.
-fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
+fn start_supplicant(cfg: &Config, libraries: Option<&Path>, held: &[saved::Saved]) -> Result<Child> {
     let home = Path::new(HOME);
     let sockets = home.join("sockets");
     fs::create_dir_all(&sockets).with_context(|| format!("make {}", sockets.display()))?;
@@ -681,8 +831,24 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
     std::os::unix::fs::chown(&sockets, Some(WIFI), Some(WIFI)).with_context(|| format!("give {} to the supplicant", sockets.display()))?;
     fs::set_permissions(&sockets, fs::Permissions::from_mode(0o770)).with_context(|| format!("keep {} to the supplicant", sockets.display()))?;
     let settings = home.join("wpa_supplicant.conf");
-    fs::write(&settings, format!("ctrl_interface={}\nupdate_config=0\np2p_disabled=1\npmf=1\nsae_pwe=2\n", sockets.display()))
-        .with_context(|| format!("write {}", settings.display()))?;
+    // The chip keeps the world-safe channels where no domain is told it,
+    // which holds none of the higher 5 GHz ones a router here sits on.
+    let mut conf = format!("ctrl_interface={}\nupdate_config=0\np2p_disabled=1\npmf=1\nsae_pwe=2\n", sockets.display());
+    if let Some(country) = &cfg.country {
+        conf.push_str(&format!("country={country}\n"));
+    }
+    // The networks joined before are set up here, for the supplicant to
+    // join the one it finds on its own. One the file says unreadably is
+    // passed over, and the rest set up still.
+    for network in held {
+        match supplicant::network_block(&network.ssid, network.security, &network.password) {
+            Ok(block) => conf.push_str(&block),
+            Err(e) => {
+                let _ = skyward_sys::kmsg(&format!("a network the phone holds is not set up: {e:#}"));
+            }
+        }
+    }
+    fs::write(&settings, conf).with_context(|| format!("write {}", settings.display()))?;
     fs::set_permissions(&settings, fs::Permissions::from_mode(0o644)).with_context(|| format!("open {} to the supplicant", settings.display()))?;
     let socket = sockets.join(&cfg.interface);
     // One an earlier run left would answer nothing.
@@ -693,6 +859,11 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
     if let Some(dir) = libraries {
         path.push(dir.to_string_lossy().into_owned());
     }
+    // What the supplicant says as it starts is kept beside the recovery's own
+    // log: one that ends at once otherwise leaves no word of why.
+    let folder = Path::new(skyward_sys::LOG).parent().unwrap_or(Path::new("/")).join("services");
+    let _ = fs::create_dir_all(&folder);
+    let said = fs::File::create(folder.join("wpa_supplicant.err"));
     let mut child = Process::new(&cfg.supplicant)
         .args(["-i", &cfg.interface, "-D", "nl80211", "-c"])
         .arg(&settings)
@@ -700,7 +871,10 @@ fn start_supplicant(cfg: &Config, libraries: Option<&Path>) -> Result<Child> {
         .current_dir("/")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(match said {
+            Ok(file) => Stdio::from(file),
+            Err(_) => Stdio::null(),
+        })
         .spawn()
         .with_context(|| format!("start {}", cfg.supplicant))?;
     let until = Instant::now() + SOCKET_WAIT;

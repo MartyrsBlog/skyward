@@ -43,6 +43,22 @@ pub fn load(dirs: &[PathBuf], names: &[String]) -> Result<Vec<PathBuf>> {
     Ok(loaded)
 }
 
+/// Load `names` one at a time, so that one the phone's own build does not
+/// carry leaves the rest to load: a driver that is not there costs its own
+/// device and nothing else. Returns the files loaded and, for each name
+/// that could not be, the name and why.
+pub fn load_each(dirs: &[PathBuf], names: &[String]) -> (Vec<PathBuf>, Vec<(String, anyhow::Error)>) {
+    let mut loaded = Vec::new();
+    let mut failed = Vec::new();
+    for name in names {
+        match load(dirs, std::slice::from_ref(name)) {
+            Ok(paths) => loaded.extend(paths),
+            Err(e) => failed.push((name.clone(), e)),
+        }
+    }
+    (loaded, failed)
+}
+
 /// A `modules.dep` graph: each module file mapped to the module files it
 /// depends on. Keys and values are reduced to bare file names so the graph is
 /// independent of where the modules were sourced from (GKI devices keep them
@@ -181,5 +197,18 @@ mod tests {
     #[test]
     fn strips_paths_to_basenames() {
         assert_eq!(basename("kernel/drivers/foo/bar.ko"), "bar.ko");
+    }
+
+    /// A configuration names every touchscreen driver the phone's builds
+    /// have carried, and only one of them is in the build it runs now: the
+    /// others are reported and the rest still load.
+    #[test]
+    fn a_module_the_build_lacks_is_named_and_does_not_stop_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("modules.dep"), "goodix_core.ko:\n").unwrap();
+        let names = ["goodix_core".to_string(), "fts_touch_spi".to_string()];
+        let (loaded, failed) = load_each(&[dir.path().to_path_buf()], &names);
+        assert!(loaded.is_empty());
+        assert_eq!(failed.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), names);
     }
 }

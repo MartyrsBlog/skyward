@@ -68,6 +68,13 @@ enum Cmd {
         /// The monospaced typeface's licence, which goes with it.
         #[arg(long)]
         mono_license: PathBuf,
+        /// A file to put in the ramdisk as it is, written as
+        /// host-path:ramdisk-path[:mode], the mode in octal. Programs and
+        /// libraries a recovery has to carry itself go this way, such as a
+        /// service directory of the version the phone's own services were
+        /// built against.
+        #[arg(long, value_name = "HOST:GUEST[:MODE]")]
+        extra: Vec<String>,
         #[arg(long)]
         out: PathBuf,
     },
@@ -125,7 +132,7 @@ fn main() -> Result<()> {
             img.kernel = BootImage::read(&kernel)?.kernel;
             write(&out, &img, &img.to_bytes()?)
         }
-        Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, out } => {
+        Cmd::Recovery { stock, binary, system_init, config, font, mono, mono_license, extra, out } => {
             let size = partition_size(&stock)?;
             let mut img = BootImage::read(&stock)?;
             let mut rd = Ramdisk::decode(&img.ramdisk)?;
@@ -136,6 +143,24 @@ fn main() -> Result<()> {
             }
             let read = |p: &PathBuf| std::fs::read(p).with_context(|| format!("read {}", p.display()));
             skyward_config::DeviceConfig::load(&config)?;
+            // A device configuration may name a path that depends on the
+            // version the phone's vendor image is, such as the folder the
+            // recovery keeps the service directories in. That version is
+            // read where the stock image's build properties give it, so the
+            // configuration and what is put beside it cannot drift apart.
+            let vendor_sdk = rd.find("prop.default").and_then(|entry| {
+                String::from_utf8_lossy(&entry.data)
+                    .lines()
+                    .find_map(|line| line.strip_prefix("ro.vendor.build.version.sdk="))
+                    .and_then(|version| version.trim().parse::<u32>().ok())
+            });
+            let mut written = read(&config)?;
+            if let Some(sdk) = vendor_sdk
+                && let Ok(text) = std::str::from_utf8(&written)
+                && text.contains("{sdk}")
+            {
+                written = text.replace("{sdk}", &sdk.to_string()).into_bytes();
+            }
             rd.replace(paths::RECOVERY, read(&binary)?)?;
             // Install scripts look for the commands a stock recovery lacks
             // among its programs, and its unzip there too, a link to ziptool
@@ -145,7 +170,7 @@ fn main() -> Result<()> {
                 rd.link(command, recovery)?;
             }
             rd.add(paths::SYSTEM_INIT, 0o755, read(&system_init)?)?;
-            rd.add(paths::CONFIG, 0o644, read(&config)?)?;
+            rd.add(paths::CONFIG, 0o644, written)?;
             rd.add(paths::FONT, 0o644, read(&font)?)?;
             rd.add(paths::MONO, 0o644, read(&mono)?)?;
             rd.add(paths::MONO_LICENSE, 0o644, read(&mono_license)?)?;
@@ -155,6 +180,18 @@ fn main() -> Result<()> {
                 rd.add(paths::TASK_PROFILES, 0o644, TASK_PROFILES.to_vec())?;
             }
             rd.add(paths::MTP_RC, 0o644, MTP_RC.to_vec())?;
+            for spec in &extra {
+                let (host, rest) = spec
+                    .split_once(':')
+                    .with_context(|| format!("{spec} is not host-path:ramdisk-path[:mode]"))?;
+                let (guest, mode) = match rest.rsplit_once(':') {
+                    Some((guest, mode)) => (guest, u32::from_str_radix(mode, 8).with_context(|| format!("{spec}: {mode} is not an octal mode"))?),
+                    None => (rest, 0o644),
+                };
+                ensure!(!guest.is_empty() && !guest.starts_with('/') && !guest.split('/').any(|c| c == ".."),
+                    "{spec}: {guest} is not a path from the top of the ramdisk");
+                rd.add(guest, mode, read(&PathBuf::from(host))?)?;
+            }
             // On an unlocked device adbd keeps root when ro.secure is 0 and
             // lets any computer in without authorization when ro.adb.secure is
             // 0; init lets a later line of a property file override an earlier

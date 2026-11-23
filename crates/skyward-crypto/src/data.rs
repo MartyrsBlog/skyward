@@ -9,7 +9,7 @@
 use crate::encryption::{self, key_dir, target, Encryption};
 use crate::gatekeeper::Gatekeeper;
 use crate::keymint::KeyMint;
-use crate::keystore::{StoredKey, Unwrap};
+use crate::keystore::{held_by_secret, StoredKey, Unwrap};
 use crate::token::Token;
 use crate::user::Bound;
 use crate::weaver::Weaver;
@@ -233,6 +233,17 @@ pub fn open_without_credential(keys: Option<&KeyMint>) -> Result<Opening> {
     let mut closed = Vec::new();
     let mut owner = Note::default();
     for user in open_users(service)? {
+        // A phone that never gave this user a screen lock need not keep a
+        // credential for them at all, and this one kept none: their own
+        // files are under a key the hardware holds, as the files readable
+        // before anyone signs in are.
+        if !has_credential(user) {
+            let note = open_user_files(service, user, None, None)?;
+            if user == OWNER {
+                owner = note;
+            }
+            continue;
+        }
         let protector = protector(user)?;
         match protector.lock {
             None => {
@@ -241,6 +252,24 @@ pub fn open_without_credential(keys: Option<&KeyMint>) -> Result<Opening> {
                     owner = note;
                 }
             }
+            // A user whose own key the key service holds in hardware needs
+            // nothing they know, whatever the phone keeps about a
+            // credential: the state it keeps may be from a screen lock its
+            // owner has taken away, and asking for what it guarded would be
+            // asking for nothing.
+            Some(lock) if !held_by_secret(&ce_current(user)) => match open_user_files(service, user, None, None) {
+                Ok(note) => {
+                    if user == OWNER {
+                        owner = note;
+                    }
+                }
+                Err(e) => closed.push(Closed {
+                    user,
+                    lock: lock.kind,
+                    made_up: made_up(user, &protector.id),
+                    why: Some(format!("{e:#}")),
+                }),
+            },
             Some(lock) => closed.push(Closed { user, lock: lock.kind, made_up: made_up(user, &protector.id), why: None }),
         }
     }
@@ -296,6 +325,9 @@ fn made_up(user: u32, id: &str) -> bool {
 const SHARED_KEY: &str = "/data/unencrypted/key";
 const SHARED_NAME: &str = "/data/unencrypted/ref";
 const FILE_MODE: &str = "/data/unencrypted/mode";
+/// Where the phone's system keeps the keys of the files it encrypted one by
+/// one: a partition given no such folder was never encrypted that way.
+const KEY_FOLDER: &str = "/data/unencrypted";
 
 /// Where the phone keeps each user's own keys.
 const USER_KEYS: &str = "/data/misc/vold/user_keys";
@@ -427,6 +459,33 @@ fn blobs(user: u32) -> PathBuf {
     Path::new(PROTECTORS).join(user.to_string()).join(BLOBS)
 }
 
+/// Whether the phone keeps any credential state for `user` at all: one
+/// blob for each way some part of the phone was given to reach their
+/// secret. Android writes one as it makes the user, so a phone that has
+/// none was never given a screen lock on that user at all.
+fn has_credential(user: u32) -> bool {
+    std::fs::read_dir(blobs(user)).is_ok_and(|entries| entries.flatten().any(|entry| entry.path().extension().is_some_and(|e| e == "spblob")))
+}
+
+/// Where a user's own key is kept.
+fn ce_current(user: u32) -> PathBuf {
+    Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current")
+}
+
+/// Open `user`'s own files where the phone keeps no credential state for
+/// them: their key is the one the hardware holds, as the key of the files
+/// readable before anyone signs in is. Nothing the user knows is needed.
+fn open_files_under_hardware_key(service: &KeyMint, user: u32) -> Result<Note> {
+    let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read {FILE_MODE}"))?;
+    let wrapped = crate::fscrypt::hardware_wrapped(mode.trim());
+    let raw = hardware_key(service, &ce_current(user), wrapped)?;
+    crate::fscrypt::add_key(Path::new(MOUNT), &raw, wrapped)?;
+    if user == OWNER {
+        show_owner_storage()?;
+    }
+    Ok(Note::default())
+}
+
 /// Where a phone keeps the credential it made up itself for a user whose
 /// screen lock is the owner's. The file holds a nonce and then the
 /// credential, encrypted under a key the owner's own secret guards.
@@ -487,6 +546,14 @@ const TAG_BYTES: usize = 16;
 /// owner's own secret gave. The owner's files open, their shared storage
 /// shows at /sdcard.
 fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owner: Option<&Token>) -> Result<Note> {
+    // A user's own key is opened the way it was wrapped. One the key
+    // service holds in hardware is behind nothing the user knows, whatever
+    // the phone keeps about a credential: the state it keeps may be from a
+    // screen lock its owner has taken away, while the key stayed wrapped
+    // as it was.
+    if !held_by_secret(&ce_current(user)) || !has_credential(user) {
+        return open_files_under_hardware_key(service, user);
+    }
     let protector = protector(user)?;
     let stretched = match &protector.lock {
         Some(lock) => {
@@ -539,7 +606,7 @@ fn open_user_files(service: &KeyMint, user: u32, credential: Option<&[u8]>, owne
 
     let mode = std::fs::read_to_string(FILE_MODE).with_context(|| format!("read {FILE_MODE}"))?;
     let wrapped = crate::fscrypt::hardware_wrapped(mode.trim());
-    let dir = Path::new(USER_KEYS).join("ce").join(user.to_string()).join("current");
+    let dir = ce_current(user);
     let stored = StoredKey::load(&dir).with_context(|| format!("read the key in {}", dir.display()))?;
     let raw = stored.unwrap(Unwrap::<KeyMint>::Secret(&file_secret)).with_context(|| format!("unwrap the key in {}", dir.display()))?;
     let raw = match wrapped {

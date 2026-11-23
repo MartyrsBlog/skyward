@@ -225,6 +225,13 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    // A recovery that stops drawing is a phone that answers nothing. What
+    // ended it is written where its log is read from, so that a screen that
+    // went black once can be told why without a serial console.
+    #[cfg(target_os = "android")]
+    std::panic::set_hook(Box::new(|said| {
+        let _ = skyward_sys::kmsg(&format!("the recovery stopped: {said}"));
+    }));
     // init starts the recovery service by path with no arguments.
     let started_as = std::env::args_os().next().unwrap_or_default();
     let name = Path::new(&started_as).file_name().unwrap_or_default();
@@ -516,7 +523,52 @@ fn module_folders(cfg: &DeviceConfig) -> Result<Vec<PathBuf>> {
 
 /// Load `names` from the module sources the configuration lists.
 fn load_modules(cfg: &DeviceConfig, names: &[String]) -> Result<Vec<PathBuf>> {
-    skyward_modules::load(&module_folders(cfg)?, names)
+    skyward_modules::load(&module_dirs(cfg)?, names)
+}
+
+/// The folders the configuration's module sources name.
+fn module_dirs(cfg: &DeviceConfig) -> Result<Vec<PathBuf>> {
+    cfg.modules.sources.iter().map(|s| skyward_modules::source_dir(s)).collect()
+}
+
+/// The folder the phone's vendor modules are in, laying out the partition
+/// they are on where the recovery's own table leaves it unmounted.
+///
+/// A phone whose vendor image is the Android 12 one keeps its modules in
+/// the vendor_dlkm partition: the vendor_boot ramdisk carries only the few
+/// a first-stage boot needs, and the recovery's table has no entry for the
+/// partition at all. Those modules are the only ones built against the
+/// kernel the phone runs, so they are what the touchscreen's driver has to
+/// come from. Where they are needed they are laid out here as a device of
+/// the recovery's own and mounted read-only; a phone that keeps them
+/// elsewhere, or has no such partition, is left as it was.
+#[cfg(target_os = "android")]
+fn vendor_modules_folder() -> Result<PathBuf> {
+    let at = Path::new("/vendor_dlkm");
+    if at.join("lib/modules").is_dir() {
+        return Ok(at.to_path_buf());
+    }
+    let slot = skyward_vab::current_slot()?.context("the phone starts from no slot")?;
+    let super_device = Path::new(skyward_block::BY_NAME).join("super");
+    let metadata = skyward_lp::read(&super_device, slot.number())?;
+    let name = format!("vendor_dlkm{}", slot.suffix());
+    let partition = metadata
+        .partition(&name)
+        .or_else(|| metadata.partition("vendor_dlkm"))
+        .with_context(|| format!("the phone's super partition holds no {name}"))?;
+    let device = skyward_block::devnum(&super_device)?;
+    let targets: Vec<skyward_block::dm::Target> = partition
+        .extents
+        .iter()
+        .map(|extent| match *extent {
+            skyward_lp::Extent::Linear { sectors, sector, .. } => skyward_block::dm::Target::Linear { sectors, device, offset: sector },
+            skyward_lp::Extent::Zero { sectors } => skyward_block::dm::Target::Zero { sectors },
+        })
+        .collect();
+    let node = skyward_block::dm::create("skyward-vendor_dlkm", &targets, true)?;
+    std::fs::create_dir_all(at).with_context(|| format!("make {}", at.display()))?;
+    skyward_block::mount::mount_ro(&node, at)?;
+    Ok(at.to_path_buf())
 }
 
 /// Start the recovery's own logd where it needs libraries of the installed
@@ -555,8 +607,55 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
         let at = skyward_block::fstab::mount(name)?;
         skyward_sys::kmsg(&format!("{name} is mounted on {}", at.display()))?;
     }
-    for path in load_modules(cfg, &cfg.modules.load)? {
+    // The vendor modules may be on a partition the recovery's own table
+    // leaves unmounted, and the touchscreen's driver may be one of them.
+    if cfg.modules.sources.iter().any(|source| source == "vendor_dlkm") {
+        match vendor_modules_folder() {
+            Ok(at) => skyward_sys::kmsg(&format!("the phone's vendor modules are at {}", at.display()))?,
+            Err(e) => skyward_sys::kmsg(&format!("the phone's vendor modules are not mounted: {e:#}"))?,
+        }
+    }
+    let (loaded, missing) = skyward_modules::load_each(&module_dirs(cfg)?, &cfg.modules.load);
+    for path in loaded {
         skyward_sys::kmsg(&format!("loaded {}", path.display()))?;
+    }
+    // A module the phone's own build does not carry costs its own device:
+    // the touchscreen without its driver, say. What reads the phone's keys
+    // must still start, so the rest of the boot goes on without it.
+    for (name, why) in missing {
+        skyward_sys::kmsg(&format!("the phone carries no {name} to load: {why:#}"))?;
+    }
+    // The nodes a driver makes belong to root until the phone's own rules
+    // are given to them, and the programs that use the keys run as users of
+    // their own: qseecom's is opened by the key service as system, and the
+    // driver leaves it to root. The rules are applied again now that the
+    // modules have made their nodes, the first pass having come too early
+    // for any of them.
+    match skyward_sys::ueventd::apply() {
+        Ok(nodes) => skyward_sys::kmsg(&format!("{nodes} device nodes given the owner their phone describes"))?,
+        Err(e) => skyward_sys::kmsg(&format!("the device nodes are not given the owners the phone describes: {e:#}"))?,
+    }
+    // The binder driver's own filesystem holds the nodes the phone's own
+    // programs open. A kernel that keeps the driver as a module has none of
+    // them until something mounts it, and until then nothing that registers
+    // a service starts at all — nor does anything that reads the keys.
+    secure::ensure_binder_nodes();
+    let binder = if Path::new("/dev/binder").exists() { "ready" } else { "missing" };
+    skyward_sys::kmsg(&format!("the binder device is {binder} at /dev/binder"))?;
+    // Where the configuration asks for it, the WLAN's chip is brought up
+    // here, while the screen is still coming up: the chip's own start takes
+    // the better part of ten seconds, which its user would wait at the
+    // switch. On its own thread, so a chip that is slow to start holds up
+    // nothing but itself.
+    if let Some(wlan) = &cfg.wlan
+        && wlan.prewarm
+    {
+        let dirs = module_dirs(cfg)?;
+        let wlan = wlan.clone();
+        std::thread::spawn(move || match wlan::prewarm(&wlan, &dirs) {
+            Ok(()) => { let _ = skyward_sys::kmsg("the WLAN's chip is up ahead of its switch"); }
+            Err(e) => { let _ = skyward_sys::kmsg(&format!("the WLAN's chip is not up ahead of its switch: {e:#}")); }
+        });
     }
     if !cfg.owners.is_empty() {
         let handed = hand_over(&cfg.owners)?;
@@ -597,8 +696,15 @@ fn bring_up(cfg: &DeviceConfig, slot: skyward_vab::Slot, found: Result<keys::Fou
     let mut told = registering.clone();
     told.extend(described.into_iter().filter(|name| !registering.contains(name)));
     if !told.is_empty() {
-        secure::publish_descriptions(&told)?;
-        skyward_sys::kmsg(&format!("the service directory is told of {} of the phone's own services", told.len()))?;
+        // A service directory that turns the telling down — a phone whose
+        // own system describes its services otherwise — leaves the phone's
+        // programs to start anyway: the ones this recovery starts for the
+        // touchscreen and the keys are not there to be told of, and neither
+        // is what decrypts the data partition.
+        match secure::publish_descriptions(&told) {
+            Ok(()) => skyward_sys::kmsg(&format!("the service directory is told of {} of the phone's own services", told.len()))?,
+            Err(e) => skyward_sys::kmsg(&format!("the service directory is not told of the phone's services: {e:#}"))?,
+        }
     }
     let libraries = secure::libraries()?;
     if let Some(dir) = &libraries {

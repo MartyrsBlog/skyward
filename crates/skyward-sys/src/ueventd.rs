@@ -1,15 +1,18 @@
 use std::collections::HashMap;
 
 /// Where the phone keeps the rules for its own device nodes, and the names
-/// its own partitions give to the accounts those rules name.
-pub const RULE_FILES: [&str; 2] = ["/vendor/etc/ueventd.rc", "/odm/etc/ueventd.rc"];
+/// its own partitions give to the accounts those rules name. The rules are
+/// read from the top of a partition as well: a phone whose build puts them
+/// beside the partition's other folders rather than under `etc` keeps them
+/// where its own init reads them.
+pub const RULE_FILES: [&str; 4] = ["/vendor/ueventd.rc", "/vendor/etc/ueventd.rc", "/odm/ueventd.rc", "/odm/etc/ueventd.rc"];
 pub const PASSWD_FILES: [&str; 2] = ["/vendor/etc/passwd", "/odm/etc/passwd"];
 pub const GROUP_FILES: [&str; 2] = ["/vendor/etc/group", "/odm/etc/group"];
 
 /// The accounts Android fixes once and for all. The rules, and the init
 /// scripts of the phone's own programs, name them rather than their
 /// numbers, and a recovery has no list of its own to look them up in.
-const ACCOUNTS: [(&str, u32); 33] = [
+const ACCOUNTS: [(&str, u32); 39] = [
     ("root", 0),
     ("system", 1000),
     ("radio", 1001),
@@ -42,6 +45,12 @@ const ACCOUNTS: [(&str, u32); 33] = [
     ("readproc", 3009),
     ("wakelock", 3010),
     ("uhid", 3011),
+    ("net_bt_admin", 3001),
+    ("net_bt", 3002),
+    ("inet", 3003),
+    ("net_raw", 3004),
+    ("net_bw_stats", 3006),
+    ("net_bw_acct", 3007),
     ("nobody", 9999),
 ];
 

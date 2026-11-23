@@ -5,6 +5,9 @@
 use crate::parcel::Parcel;
 #[cfg(target_os = "android")]
 use crate::status;
+// The functions that answer the directory need the driver, which only the
+// phone carries: on the computer the two types go unused.
+#[cfg(target_os = "android")]
 use anyhow::{Context, Result};
 
 /// The directory every program registers with and looks things up in.
@@ -41,12 +44,35 @@ fn methods_of(sdk: u32) -> Methods {
     }
 }
 
-/// The recovery's own version, which its property files give.
-const SDK: &str = "ro.build.version.sdk";
+/// Ask the directory which numbering it keeps. A recovery may have started
+/// the installed system's own directory, built from a version of its own, so
+/// the numbering is found out rather than assumed.
+#[cfg(target_os = "android")]
+fn methods(binder: &crate::driver::Binder) -> Result<Methods> {
+    static KEPT: std::sync::OnceLock<Methods> = std::sync::OnceLock::new();
+    if let Some(kept) = KEPT.get() {
+        return Ok(*kept);
+    }
+    let mut tried = methods_of(LOOKUPS_DECLARED - 1);
+    for candidate in [methods_of(LOOKUPS_DECLARED), tried] {
+        tried = candidate;
+        if probe(binder, candidate.check_service).is_ok() {
+            let _ = KEPT.set(candidate);
+            return Ok(candidate);
+        }
+    }
+    Ok(tried)
+}
 
-fn methods() -> Result<Methods> {
-    let sdk = skyward_sys::prop(SDK).with_context(|| format!("the recovery says no {SDK}"))?;
-    Ok(methods_of(sdk.parse().with_context(|| format!("{SDK} is {sdk:?}"))?))
+/// Ask the directory a lookup numbered `code` after a name nothing
+/// registers: any answer at all is what is looked for.
+#[cfg(target_os = "android")]
+fn probe(binder: &crate::driver::Binder, code: u32) -> Result<()> {
+    let directory = binder.directory()?;
+    let mut call = Parcel::call(DIRECTORY);
+    call.string(DIRECTORY);
+    let reply = directory.transact(code, &call)?;
+    status::ok(&mut reply.read())
 }
 
 /// Every dump priority a service can register at, and the one a service
@@ -87,7 +113,7 @@ pub fn find<'a>(binder: &'a crate::driver::Binder, name: &str) -> Result<Option<
     let directory = binder.directory()?;
     let mut call = Parcel::call(DIRECTORY);
     call.string(name);
-    let reply = directory.transact(methods()?.check_service, &call).with_context(|| format!("look up {name}"))?;
+    let reply = directory.transact(methods(binder)?.check_service, &call).with_context(|| format!("look up {name}"))?;
     let mut read = reply.read();
     status::ok(&mut read).with_context(|| format!("look up {name}"))?;
     match read.object().with_context(|| format!("read what the directory answered for {name}"))? {
@@ -108,7 +134,7 @@ pub fn add(binder: &crate::driver::Binder, name: &str, number: u64) -> Result<()
     call.object(number);
     call.bool(false);
     call.i32(DUMP_PRIORITY_DEFAULT);
-    let reply = directory.transact(methods()?.add_service, &call).with_context(|| format!("register {name}"))?;
+    let reply = directory.transact(methods(binder)?.add_service, &call).with_context(|| format!("register {name}"))?;
     status::ok(&mut reply.read()).with_context(|| format!("register {name}"))
 }
 
@@ -119,7 +145,7 @@ pub fn names(binder: &crate::driver::Binder) -> Result<Vec<String>> {
     let directory = binder.directory()?;
     let mut call = Parcel::call(DIRECTORY);
     call.i32(DUMP_PRIORITY_ALL);
-    let reply = directory.transact(methods()?.list_services, &call).context("list what has registered")?;
+    let reply = directory.transact(methods(binder)?.list_services, &call).context("list what has registered")?;
     let mut read = reply.read();
     status::ok(&mut read).context("list what has registered")?;
     let count = read.i32().context("read how many have registered")?;
@@ -151,7 +177,7 @@ pub fn declared(binder: &crate::driver::Binder, name: &str) -> Result<bool> {
     let directory = binder.directory()?;
     let mut call = Parcel::call(DIRECTORY);
     call.string(name);
-    let reply = directory.transact(methods()?.is_declared, &call).with_context(|| format!("ask whether {name} is described"))?;
+    let reply = directory.transact(methods(binder)?.is_declared, &call).with_context(|| format!("ask whether {name} is described"))?;
     let mut read = reply.read();
     status::ok(&mut read).with_context(|| format!("ask whether {name} is described"))?;
     read.bool().with_context(|| format!("read whether {name} is described"))

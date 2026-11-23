@@ -36,14 +36,34 @@ pub fn check(image: &[u8], codename: &str) -> Result<()> {
 /// The slots whose recovery partition, among the links in `dir`, the newer
 /// build goes into, slot A first: `next`, the slot that starts next, and
 /// any other whose partition holds Skyward now, any build of it.
+///
+/// A partition the other slot holds need not be one this recovery can read:
+/// a phone may keep another recovery there, whose ramdisk is packed in a way
+/// this one does not take. Such a partition is not Skyward, so it is left
+/// alone, and an update of the starting slot still goes through. A failure
+/// to look into it is a reason to skip it, not one to stop the update before
+/// anything is written.
 pub fn slots(dir: &Path, next: Slot) -> Result<Vec<Slot>> {
     let mut slots = Vec::new();
     for slot in [Slot::A, Slot::B] {
         let path = image::device(dir, PARTITION, slot);
         let mut file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
         image::drop_cache(&file).with_context(|| format!("drop the cached pages of {}", path.display()))?;
-        if slot == next || image::is_skyward(&mut file).with_context(|| format!("look into {}", path.display()))? {
+        if slot == next {
             slots.push(slot);
+            continue;
+        }
+        match image::is_skyward(&mut file) {
+            Ok(true) => slots.push(slot),
+            Ok(false) => {}
+            // A failure to say the reason must not stop an update that can
+            // still go into the slot that starts next.
+            Err(e) => {
+                let reason = format!("{} cannot be read as a Skyward recovery, so it is left alone: {e:#}", path.display());
+                if skyward_sys::kmsg(&reason).is_err() {
+                    eprintln!("{reason}");
+                }
+            }
         }
     }
     Ok(slots)
@@ -116,6 +136,20 @@ mod tests {
         assert_eq!(slots(partitions(&skyward, &skyward, size).path(), Slot::A).unwrap(), [Slot::A, Slot::B], "an older build in the other slot");
         assert_eq!(slots(partitions(&stock, &skyward, size).path(), Slot::A).unwrap(), [Slot::A, Slot::B], "Skyward started without being flashed");
         assert_eq!(slots(partitions(&stock, &stock, size).path(), Slot::B).unwrap(), [Slot::B]);
+    }
+
+    #[test]
+    fn a_recovery_in_the_other_slot_this_cannot_read_is_left_alone() {
+        use crate::image::samples::boot_image;
+        // A recovery whose ramdisk starts like an LZ4 frame but goes on to
+        // declare a block this decoder will not take, as some other
+        // recoveries do. Looking into it must not stop an update.
+        let unreadable = boot_image(0, &[0x04, 0x22, 0x4d, 0x18, 0x60, 0x00, 0x00, 0x00]);
+        let skyward = skyward_for("ishtar");
+        let size = skyward.len().max(unreadable.len()) + 4096;
+        assert!(crate::image::is_skyward(&mut std::io::Cursor::new(&unreadable)).is_err(), "the sample is unreadable");
+        assert_eq!(slots(partitions(&skyward, &unreadable, size).path(), Slot::A).unwrap(), [Slot::A], "the other slot is skipped, not fatal");
+        assert_eq!(slots(partitions(&unreadable, &skyward, size).path(), Slot::A).unwrap(), [Slot::A, Slot::B], "Skyward in the other slot is still found");
     }
 
     #[test]
